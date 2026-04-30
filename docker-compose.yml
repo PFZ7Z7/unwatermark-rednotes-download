@@ -1,0 +1,34 @@
+services:
+  xhs:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: xhs-downloader:latest
+    container_name: xhs-downloader
+    restart: unless-stopped
+    ports:
+      # 宿主机:容器   改成 "80:3001" 可直接通过 http://服务器/ 访问
+      - "3001:3001"
+    environment:
+      NODE_ENV: production
+      PORT: 3001
+      # CORS：同源访问用不到；如需跨域前端，用逗号分隔
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001}
+      # MediaCrawler 跑在宿主机 → 通过 host.docker.internal 访问
+      MEDIACRAWLER_API: ${MEDIACRAWLER_API:-http://host.docker.internal:8080}
+      # 容器内路径：由下方 volumes 挂载到宿主机的真实位置
+      MEDIACRAWLER_BROWSER_DATA: /mnt/mediacrawler/browser_data/xhs_user_data_dir
+      MEDIACRAWLER_DATA_DIR: /mnt/mediacrawler/data
+      # 其他可选调参（见 backend/.env.example）
+      MEDIACRAWLER_CONCURRENCY: ${MEDIACRAWLER_CONCURRENCY:-1}
+      RESULT_CACHE_TTL_MS: ${RESULT_CACHE_TTL_MS:-300000}
+      DOWNLOAD_CONCURRENCY: ${DOWNLOAD_CONCURRENCY:-5}
+    volumes:
+      # 宿主机上 MediaCrawler 的 browser_data（读写：登录态会被 Chromium 写回）
+      - ${MC_HOST_BROWSER_DATA:?请在 .env 里设置 MC_HOST_BROWSER_DATA 指向宿主机 MediaCrawler/browser_data}:/mnt/mediacrawler/browser_data
+      # 宿主机上 MediaCrawler 的 data（读写：清理历史数据需要删 JSON）
+      - ${MC_HOST_DATA:?请在 .env 里设置 MC_HOST_DATA 指向宿主机 MediaCrawler/data}:/mnt/mediacrawler/data
+    # Linux 上必须显式声明，Windows / macOS Docker Desktop 默认已支持
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    # 健康检查由 Dockerfile 的 HEALTHCHECK 指令负责，这里无需重复

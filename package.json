@@ -1,0 +1,12 @@
+{
+  "name": "xiaohongshv-clone",
+  "version": "1.0.0",
+  "private": true,
+  "description": "小红书无水印下载工具 — 根目录启停脚本",
+  "scripts": {
+    "start": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1",
+    "start:clean": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/start.ps1 -Clean",
+    "stop": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/stop.ps1",
+    "restart": "powershell -NoProfile -ExecutionPolicy Bypass -File scripts/restart.ps1"
+  }
+}

@@ -797,8 +797,44 @@ select:focus-visible {
   line-height: 1.6;
 }
 
+.note-meta-line {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin: -4px 0 14px;
+  color: var(--text-muted);
+  font-size: 13px;
+}
+
+.topic-tags {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 16px;
+}
+
+.topic-tag {
+  display: inline-flex;
+  align-items: center;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid #bfdbfe;
+  border-radius: 999px;
+  color: #1d4ed8;
+  background: #eff6ff;
+  font-size: 13px;
+  font-weight: 600;
+  text-decoration: none;
+}
+
+.topic-tag:hover {
+  border-color: #93c5fd;
+  background: #dbeafe;
+}
+
 .note-stats {
   display: flex;
+  flex-wrap: wrap;
   gap: 20px;
   font-size: 14px;
   color: var(--text-muted);
@@ -828,7 +864,8 @@ select:focus-visible {
 }
 
 .media-type-pill,
-.watermark-pill {
+.watermark-pill,
+.live-photo-pill {
   display: inline-flex;
   align-items: center;
   min-height: 28px;
@@ -842,6 +879,12 @@ select:focus-visible {
   color: var(--text-primary);
   background: #fff;
   border: 1px solid var(--border-color);
+}
+
+.live-photo-pill {
+  color: #7c2d12;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
 }
 
 .watermark-pill.ok {
@@ -936,6 +979,24 @@ select:focus-visible {
   display: block;
 }
 
+.live-photo-badge {
+  position: absolute;
+  top: 8px;
+  left: 8px;
+  z-index: 1;
+  padding: 3px 8px;
+  border-radius: 999px;
+  color: #fff;
+  background: rgba(124, 45, 18, 0.86);
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.image-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+}
+
 .download-btn {
   width: 100%;
   padding: 10px 16px;
@@ -950,6 +1011,14 @@ select:focus-visible {
 
 .download-btn:hover {
   background: var(--primary-hover);
+}
+
+.live-download {
+  background: #7c2d12;
+}
+
+.live-download:hover {
+  background: #9a3412;
 }
 
 .video-download {
@@ -1070,6 +1139,19 @@ select:focus-visible {
 
 .note-type-badge {
   font-size: 18px;
+}
+
+.live-table-badge {
+  display: block;
+  width: fit-content;
+  margin: 4px auto 0;
+  padding: 1px 6px;
+  color: #7c2d12;
+  background: #fff7ed;
+  border: 1px solid #fed7aa;
+  border-radius: 4px;
+  font-size: 11px;
+  line-height: 1.4;
 }
 
 /* 视频水印警告：笔记详情页顶部条 */

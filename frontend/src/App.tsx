@@ -12,13 +12,25 @@ interface NoteInfo {
     userId?: string;
   };
   images: string[];
+  livePhotos?: Array<{
+    imageUrl: string;
+    videoUrl: string;
+    videoUrls?: string[];
+    index: number;
+    duration: number;
+  }>;
   video?: {
     url: string;
     duration: number;
+    backupUrls?: string[];
   };
   likes: number;
   collects: number;
   comments: number;
+  shares?: number;
+  publishTime?: number;
+  ipLocation?: string;
+  tags?: Array<{ id: string; name: string; type: string }>;
   noteUrl?: string;
   creatorUrl?: string;
   hasWatermark?: boolean; // 视频疑似带水印（登录态失效时会为 true）
@@ -62,6 +74,28 @@ type ErrorSummary = {
   message: string;
   showLoginAction: boolean;
 };
+
+const TOPIC_PATTERN = /#([^#]+?)\[话题\]#/g;
+
+const buildTopicUrl = (name: string): string =>
+  `https://www.xiaohongshu.com/search_result/?keyword=${encodeURIComponent(encodeURIComponent(name))}&type=54&source=web_note_detail_r10`;
+
+const formatPublishTime = (timestamp?: number): string => {
+  if (!timestamp) return '';
+  const normalized = timestamp < 10_000_000_000 ? timestamp * 1000 : timestamp;
+  const date = new Date(normalized);
+  if (Number.isNaN(date.getTime())) return '';
+  return new Intl.DateTimeFormat('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+    hour: '2-digit',
+    minute: '2-digit',
+  }).format(date);
+};
+
+const stripTopicMarkers = (desc: string, hasStructuredTags: boolean): string =>
+  hasStructuredTags ? desc.replace(TOPIC_PATTERN, '').replace(/\s{2,}/g, ' ').trim() : desc;
 
 const classifyErrorMessage = (message: string, needsLogin: boolean): ErrorSummary => {
   const lower = message.toLowerCase();
@@ -526,9 +560,13 @@ function App() {
     }
   }, [url, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError]);
 
-  const handleDownload = useCallback((downloadUrl: string, filename: string) => {
+  const handleDownload = useCallback((downloadUrl: string, filename: string, fallbackUrls: string[] = []) => {
+    const params = new URLSearchParams({ url: downloadUrl });
+    if (fallbackUrls.length > 0) {
+      params.set('fallbackUrls', JSON.stringify(fallbackUrls));
+    }
     const link = document.createElement('a');
-    link.href = `${API_BASE}/api/download?url=${encodeURIComponent(downloadUrl)}`;
+    link.href = `${API_BASE}/api/download?${params.toString()}`;
     link.download = filename;
     link.rel = 'noopener';
     document.body.appendChild(link);
@@ -537,7 +575,8 @@ function App() {
   }, [API_BASE]);
 
   const handleDownloadNoteImages = useCallback(async (note: NoteInfo) => {
-    if (note.images.length <= 1) {
+    const livePhotoCount = note.livePhotos?.length || 0;
+    if (livePhotoCount === 0 && note.images.length <= 1) {
       if (note.images[0]) {
         handleDownload(note.images[0], `image_${note.noteId}_1.jpg`);
       }
@@ -569,7 +608,9 @@ function App() {
       link.click();
       link.remove();
       window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
-      showNotice('success', `已开始打包下载 ${note.images.length} 张图片`);
+      showNotice('success', livePhotoCount > 0
+        ? `已开始打包下载 ${livePhotoCount} 组实况组件`
+        : `已开始打包下载 ${note.images.length} 张图片`);
     } catch (err) {
       const message = err instanceof Error ? err.message : '打包下载失败';
       setError(message);
@@ -676,6 +717,8 @@ function App() {
   };
 
   const currentError = error ? classifyErrorMessage(error, errorNeedsLogin) : null;
+  const notePublishTime = formatPublishTime(noteInfo?.publishTime);
+  const noteDisplayDesc = noteInfo ? stripTopicMarkers(noteInfo.desc, Boolean(noteInfo.tags?.length)) : '';
 
   return (
     <div className="app">
@@ -974,17 +1017,46 @@ function App() {
               )}
             </div>
             <h2 className="note-title">{noteInfo.title}</h2>
-            {noteInfo.desc && <p className="note-desc">{noteInfo.desc}</p>}
+            {noteDisplayDesc && <p className="note-desc">{noteDisplayDesc}</p>}
             <div className="note-stats">
               <span>❤️ {formatNumber(noteInfo.likes)}</span>
               <span>⭐ {formatNumber(noteInfo.collects)}</span>
               <span>💬 {formatNumber(noteInfo.comments)}</span>
+              {typeof noteInfo.shares === 'number' && noteInfo.shares > 0 && (
+                <span>↗ {formatNumber(noteInfo.shares)}</span>
+              )}
             </div>
+            {(notePublishTime || noteInfo.ipLocation) && (
+              <div className="note-meta-line">
+                {notePublishTime && <span>发布于 {notePublishTime}</span>}
+                {noteInfo.ipLocation && <span>IP 属地 {noteInfo.ipLocation}</span>}
+              </div>
+            )}
+            {noteInfo.tags && noteInfo.tags.length > 0 && (
+              <div className="topic-tags" aria-label="话题标签">
+                {noteInfo.tags.map((tag) => (
+                  <a
+                    key={`${tag.id || tag.name}-${tag.name}`}
+                    className="topic-tag"
+                    href={buildTopicUrl(tag.name)}
+                    target="_blank"
+                    rel="noreferrer"
+                  >
+                    {tag.name}
+                  </a>
+                ))}
+              </div>
+            )}
             <div className="result-toolbar">
               <div className="result-summary">
                 <span className="media-type-pill">
                   {noteInfo.type === 'video' ? '视频' : '图集'} · {noteInfo.type === 'video' ? '1 个文件' : `${noteInfo.images.length} 张图片`}
                 </span>
+                {(noteInfo.livePhotos?.length || 0) > 0 && (
+                  <span className="live-photo-pill">
+                    实况图 · {noteInfo.livePhotos!.length} 组
+                  </span>
+                )}
                 {noteInfo.type === 'video' && (
                   <span className={`watermark-pill ${noteInfo.hasWatermark ? 'warning' : 'ok'}`}>
                     {noteInfo.hasWatermark ? '视频源可能带水印' : '视频源无水印'}
@@ -1003,7 +1075,7 @@ function App() {
                   </a>
                 )}
                 {noteInfo.type === 'video' && noteInfo.video ? (
-                  <button className="primary-action-btn" onClick={() => handleDownload(noteInfo.video!.url, `video_${noteInfo.noteId}.mp4`)}>
+                  <button className="primary-action-btn" onClick={() => handleDownload(noteInfo.video!.url, `video_${noteInfo.noteId}.mp4`, noteInfo.video!.backupUrls || [])}>
                     下载视频
                   </button>
                 ) : noteInfo.images.length > 0 ? (
@@ -1014,7 +1086,9 @@ function App() {
                   >
                     {noteDownloading
                       ? '打包中...'
-                      : noteInfo.images.length > 1
+                      : (noteInfo.livePhotos?.length || 0) > 0
+                        ? `打包下载实况组件 (${noteInfo.livePhotos!.length})`
+                        : noteInfo.images.length > 1
                         ? `打包下载图片 (${noteInfo.images.length})`
                         : '下载图片'}
                   </button>
@@ -1048,17 +1122,28 @@ function App() {
                 </div>
               ) : (
                 <div className="images-grid">
-                  {noteInfo.images.map((img, index) => (
-                    <div key={index} className="image-item">
-                      <img src={getProxyUrl(img, 'image')} alt={`图片 ${index + 1}`} className="preview-image"
-                        loading="lazy"
-                        decoding="async"
-                        onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/400x500?text=加载失败'; }} />
-                      <button className="download-btn" onClick={() => handleDownload(img, `image_${noteInfo.noteId}_${index + 1}.jpg`)}>
-                        📥 下载图片 {index + 1}
-                      </button>
-                    </div>
-                  ))}
+                  {noteInfo.images.map((img, index) => {
+                    const livePhoto = noteInfo.livePhotos?.find(item => item.index === index);
+                    return (
+                      <div key={index} className="image-item">
+                        {livePhoto && <span className="live-photo-badge">实况</span>}
+                        <img src={getProxyUrl(img, 'image')} alt={`图片 ${index + 1}`} className="preview-image"
+                          loading="lazy"
+                          decoding="async"
+                          onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/400x500?text=加载失败'; }} />
+                        <div className="image-actions">
+                          <button className="download-btn" onClick={() => handleDownload(img, `image_${noteInfo.noteId}_${index + 1}.jpg`)}>
+                            📥 图片 {index + 1}
+                          </button>
+                          {livePhoto && (
+                            <button className="download-btn live-download" onClick={() => handleDownload(livePhoto.videoUrl, `live_${noteInfo.noteId}_${index + 1}.mp4`, (livePhoto.videoUrls || []).filter(item => item !== livePhoto.videoUrl))}>
+                              🎞 动态
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                    );
+                  })}
                 </div>
               )}
             </div>
@@ -1116,6 +1201,9 @@ function App() {
                   </div>
                   <div className="col-type">
                     <span className="note-type-badge">{note.type === 'video' ? '🎬' : '🖼️'}</span>
+                    {(note.livePhotos?.length || 0) > 0 && (
+                      <span className="live-table-badge" title="包含实况图动态组件">实况</span>
+                    )}
                     {note.type === 'video' && note.hasWatermark && (
                       <span className="watermark-badge" title="未获取到无水印源，可能带水印">水印</span>
                     )}
@@ -1191,7 +1279,7 @@ function App() {
                       {note.type === 'video' && note.video ? (
                         <button
                           className="action-btn download-btn-table"
-                          onClick={() => handleDownload(note.video!.url, `video_${note.noteId}.mp4`)}
+                          onClick={() => handleDownload(note.video!.url, `video_${note.noteId}.mp4`, note.video!.backupUrls || [])}
                           title="下载视频"
                           aria-label="下载视频"
                         >
@@ -1200,13 +1288,9 @@ function App() {
                       ) : (
                         <button
                           className="action-btn download-btn-table"
-                          onClick={() => {
-                            note.images.forEach((img, index) => {
-                              setTimeout(() => handleDownload(img, `image_${note.noteId}_${index + 1}.jpg`), index * 300);
-                            });
-                          }}
-                          title="下载图片"
-                          aria-label="下载图片"
+                          onClick={() => handleDownloadNoteImages(note)}
+                          title={(note.livePhotos?.length || 0) > 0 ? '打包下载实况组件' : '下载图片'}
+                          aria-label={(note.livePhotos?.length || 0) > 0 ? '打包下载实况组件' : '下载图片'}
                         >
                           📥
                         </button>

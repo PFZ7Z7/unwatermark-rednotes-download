@@ -30,10 +30,15 @@ export interface AnonymousNoteRaw {
   type: 'video' | 'image';
   user: { nickname: string; avatar: string; user_id: string };
   image_list: string[];
-  video?: { url: string; duration: number; origin_video_key?: string; master_url?: string };
+  live_photos?: Array<{ image_url: string; video_url: string; video_urls?: string[]; index: number; duration: number }>;
+  video?: { url: string; duration: number; origin_video_key?: string; master_url?: string; backup_urls?: string[] };
   liked_count: number;
   collected_count: number;
   comment_count: number;
+  share_count?: number;
+  publish_time?: number;
+  ip_location?: string;
+  tags?: Array<{ id: string; name: string; type: string }>;
   xsec_token: string;
 }
 
@@ -183,16 +188,48 @@ function toHttps(url: string): string {
   return url;
 }
 
+function collectStreamUrls(stream: any): string[] {
+  const urls: string[] = [];
+  for (const codec of ['h264', 'h265', 'av1', 'h266']) {
+    const value = stream?.[codec];
+    const items = Array.isArray(value) ? value : value ? [value] : [];
+    for (const item of items) {
+      const master = item?.masterUrl || item?.master_url || '';
+      if (typeof master === 'string' && master) urls.push(toHttps(master));
+      const backups = item?.backupUrls || item?.backup_urls || [];
+      if (Array.isArray(backups)) {
+        for (const backup of backups) {
+          if (typeof backup === 'string' && backup) urls.push(toHttps(backup));
+        }
+      }
+    }
+  }
+  return Array.from(new Set(urls));
+}
+
 /** 从 note 节点映射成项目统一结构 */
 function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNoteRaw {
   // 图片
   const images: string[] = [];
+  const livePhotos: NonNullable<AnonymousNoteRaw['live_photos']> = [];
   const imageList = note.imageList || note.image_list || [];
   if (Array.isArray(imageList)) {
-    for (const img of imageList) {
+    imageList.forEach((img, index) => {
       const url = img?.urlDefault || img?.url_default || img?.url || img;
-      if (typeof url === 'string' && url) images.push(toHttps(url));
-    }
+      const imageUrl = typeof url === 'string' && url ? toHttps(url) : '';
+      if (imageUrl) images.push(imageUrl);
+
+      const videoUrls = collectStreamUrls(img?.stream);
+      if (img?.livePhoto === true && imageUrl && videoUrls.length > 0) {
+        livePhotos.push({
+          image_url: imageUrl,
+          video_url: videoUrls[0],
+          video_urls: videoUrls,
+          index,
+          duration: img?.stream?.duration || img?.duration || 0,
+        });
+      }
+    });
   }
 
   // 视频：origin_video_key → sns-video-bd.xhscdn.com
@@ -201,20 +238,19 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
     note.video?.consumer?.originVideoKey ||
     note.video?.consumer?.origin_video_key ||
     '';
-  const masterUrl = note.video?.media?.stream?.h264?.[0]?.masterUrl
-    || note.video?.media?.stream?.h264?.[0]?.master_url
-    || '';
+  const videoUrls = collectStreamUrls(note.video?.media?.stream);
   if (originKey) {
     video = {
       url: `https://sns-video-bd.xhscdn.com/${originKey}`,
       duration: note.video?.capa?.duration || note.video?.duration || 0,
       origin_video_key: originKey,
     };
-  } else if (masterUrl) {
+  } else if (videoUrls.length > 0) {
     video = {
-      url: toHttps(masterUrl),
+      url: videoUrls[0],
       duration: note.video?.capa?.duration || note.video?.duration || 0,
-      master_url: masterUrl,
+      master_url: videoUrls[0],
+      backup_urls: videoUrls.slice(1),
     };
   }
 
@@ -223,6 +259,7 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
   const userId = user.userId || user.user_id || note.userId || '';
 
   const interact = note.interactInfo || note.interact_info || {};
+  const tagList = Array.isArray(note.tagList || note.tag_list) ? (note.tagList || note.tag_list) : [];
 
   const type: 'video' | 'image' =
     note.type === 'video' || note.noteType === 'video' || video ? 'video' : 'image';
@@ -238,10 +275,21 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
       user_id: userId,
     },
     image_list: images,
+    live_photos: livePhotos.length > 0 ? livePhotos : undefined,
     video,
     liked_count: parseMetric(interact.likedCount ?? interact.liked_count ?? note.likedCount),
     collected_count: parseMetric(interact.collectedCount ?? interact.collected_count ?? note.collectedCount),
     comment_count: parseMetric(interact.commentCount ?? interact.comment_count ?? note.commentCount),
+    share_count: parseMetric(interact.shareCount ?? interact.share_count ?? note.shareCount),
+    publish_time: Number(note.time || note.publishTime || note.publish_time || 0) || undefined,
+    ip_location: note.ipLocation || note.ip_location || '',
+    tags: tagList
+      .map((tag: any) => ({
+        id: String(tag?.id || ''),
+        name: String(tag?.name || '').trim(),
+        type: String(tag?.type || ''),
+      }))
+      .filter((tag: any) => tag.name),
     xsec_token: xsecToken,
   };
 }

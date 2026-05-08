@@ -72,6 +72,17 @@ function sanitizeFileSegment(value: unknown, fallback: string): string {
   return cleaned || fallback;
 }
 
+function parseFallbackUrls(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'string') return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is string => typeof item === 'string' && item.length > 0);
+  } catch {
+    return [];
+  }
+}
+
 function createUniqueFilename(filename: string, used: Set<string>): string {
   if (!used.has(filename)) {
     used.add(filename);
@@ -489,7 +500,10 @@ app.get('/api/proxy/image', async (req: Request, res: Response) => {
 // 下载单个文件
 app.get('/api/download', async (req: Request, res: Response) => {
   try {
-    const { url } = req.query;
+    const { url, fallbackUrls } = req.query;
+    const candidateUrls = typeof url === 'string'
+      ? Array.from(new Set([url, ...parseFallbackUrls(fallbackUrls)])).filter(isAllowedProxyUrl)
+      : [];
     if (!url || typeof url !== 'string') {
       return res.status(400).json({ success: false, message: '请提供下载链接' });
     }
@@ -498,7 +512,21 @@ app.get('/api/download', async (req: Request, res: Response) => {
       return res.status(403).json({ success: false, message: '禁止下载白名单外的域名' });
     }
 
-    const result = await xhsService.downloadFile(url);
+    let result = null;
+    let lastError = '';
+    for (const candidateUrl of candidateUrls) {
+      try {
+        result = await xhsService.downloadFile(candidateUrl);
+        break;
+      } catch (err: any) {
+        lastError = err.message;
+        console.warn(`[下载] 候选地址失败: ${redactUrl(candidateUrl)} - ${err.message}`);
+      }
+    }
+
+    if (!result) {
+      return res.status(502).json({ success: false, message: lastError || 'download failed' });
+    }
     res.setHeader('Content-Type', result.contentType);
     res.setHeader('Content-Disposition', result.contentDisposition);
     res.send(result.data);
@@ -519,7 +547,7 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
     console.log(`[API] 打包下载: ${notes.length} 个笔记`);
 
     // 收集所有下载URL（同时过滤白名单外的链接）
-    const downloadItems: { url: string; filename: string }[] = [];
+    const downloadItems: { url: string; filename: string; fallbackUrls?: string[] }[] = [];
     const usedFilenames = new Set<string>();
     for (const note of notes) {
       const noteId = sanitizeFileSegment(note?.noteId, 'note');
@@ -527,11 +555,33 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
         const filename = createUniqueFilename(`${noteId}_video.mp4`, usedFilenames);
         downloadItems.push({
           url: note.video.url,
-          filename
+          filename,
+          fallbackUrls: Array.isArray(note.video.backupUrls) ? note.video.backupUrls : undefined
         });
       } else if (note.images && note.images.length > 0) {
+        const livePhotoImageIndexes = new Set<number>();
+        if (Array.isArray(note.livePhotos) && note.livePhotos.length > 0) {
+          note.livePhotos.forEach((item: any, idx: number) => {
+            const liveIndex = Number.isInteger(item?.index) ? Number(item.index) : idx;
+            if (isAllowedProxyUrl(item?.imageUrl)) {
+              livePhotoImageIndexes.add(liveIndex);
+              downloadItems.push({
+                url: item.imageUrl,
+                filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.jpg`, usedFilenames)
+              });
+            }
+            if (isAllowedProxyUrl(item?.videoUrl)) {
+              downloadItems.push({
+                url: item.videoUrl,
+                filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.mp4`, usedFilenames),
+                fallbackUrls: Array.isArray(item?.videoUrls) ? item.videoUrls.filter((url: string) => url !== item.videoUrl) : undefined
+              });
+            }
+          });
+        }
+
         note.images.forEach((img: string, idx: number) => {
-          if (isAllowedProxyUrl(img)) {
+          if (!livePhotoImageIndexes.has(idx) && isAllowedProxyUrl(img)) {
             const filename = createUniqueFilename(`${noteId}_img${idx + 1}.jpg`, usedFilenames);
             downloadItems.push({
               url: img,
@@ -571,21 +621,36 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
     // 低内存流式打包：逐个拉取文件并直接写入 zip，避免把所有文件 buffer 堆在内存里。
     const failedItems: string[] = [];
     for (const item of downloadItems) {
-      try {
-        const response = await axios.get(item.url, {
-          responseType: 'stream',
-          headers: {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Referer': 'https://www.xiaohongshu.com/',
-          },
-          timeout: 30000
-        });
-        archive.append(response.data, { name: item.filename });
-        await waitForReadableEnd(response.data);
-        console.log(`[打包] 流式添加: ${item.filename}`);
-      } catch (err: any) {
-        console.error(`[打包] 失败: ${item.filename} - ${err.message}`);
-        failedItems.push(`${item.filename}: ${err.message}`);
+      const candidateUrls = Array.from(new Set([
+        item.url,
+        ...(item.fallbackUrls || []),
+      ])).filter(isAllowedProxyUrl);
+      let added = false;
+      let lastError = '';
+
+      for (const candidateUrl of candidateUrls) {
+        if (added) break;
+        try {
+          const response = await axios.get(candidateUrl, {
+            responseType: 'stream',
+            headers: {
+              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+              'Referer': 'https://www.xiaohongshu.com/',
+            },
+            timeout: 30000
+          });
+          archive.append(response.data, { name: item.filename });
+          await waitForReadableEnd(response.data);
+          console.log(`[打包] 流式添加: ${item.filename}`);
+          added = true;
+        } catch (err: any) {
+          lastError = err.message;
+          console.error(`[打包] 失败: ${item.filename} - ${err.message}`);
+        }
+      }
+
+      if (!added) {
+        failedItems.push(`${item.filename}: ${lastError || '所有备用地址均不可用'}`);
       }
     }
 

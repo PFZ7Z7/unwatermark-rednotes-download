@@ -11,10 +11,15 @@ interface NoteInfo {
   type: 'image' | 'video';
   author: { nickname: string; avatar: string; userId?: string; };
   images: string[];
-  video?: { url: string; duration: number; };
+  livePhotos?: Array<{ imageUrl: string; videoUrl: string; videoUrls?: string[]; index: number; duration: number }>;
+  video?: { url: string; duration: number; backupUrls?: string[] };
   likes: number;
   collects: number;
   comments: number;
+  shares?: number;
+  publishTime?: number;
+  ipLocation?: string;
+  tags?: Array<{ id: string; name: string; type: string }>;
   noteUrl?: string;      // 笔记原地址
   creatorUrl?: string;   // 博主主页地址
   hasWatermark?: boolean; // 视频是否疑似带水印（无法拿到 origin_video_key 时为 true）
@@ -501,6 +506,7 @@ export class XiaohongshuService {
   private parseNoteData(data: any, noteId: string): NoteInfo {
     // 提取图片 - image_list 可能是字符串（逗号分隔）或数组
     const images: string[] = [];
+    const livePhotos: NonNullable<NoteInfo['livePhotos']> = [];
     const imageList = data.image_list;
     if (imageList) {
       if (typeof imageList === 'string') {
@@ -513,19 +519,31 @@ export class XiaohongshuService {
         }
       } else if (Array.isArray(imageList)) {
         // 数组类型
-        for (const img of imageList) {
+        imageList.forEach((img, index) => {
           const url = img.url_default || img.url || img;
-          if (typeof url === 'string') {
-            images.push(this.toHttps(this.cleanUrl(url)));
+          const imageUrl = typeof url === 'string' ? this.toHttps(this.cleanUrl(url)) : '';
+          if (imageUrl) {
+            images.push(imageUrl);
           }
-        }
+
+          const videoUrls = this.collectStreamUrls(img?.stream);
+          if (img?.livePhoto === true && imageUrl && videoUrls.length > 0) {
+            livePhotos.push({
+              imageUrl,
+              videoUrl: videoUrls[0],
+              videoUrls,
+              index,
+              duration: img?.stream?.duration || img?.duration || 0,
+            });
+          }
+        });
       }
     }
 
     // 提取视频：优先自己从 consumer.origin_video_key 拼接无水印 URL
     // 只有当 MediaCrawler 还保留了原始 video 对象时这一分支才会命中
     // （默认 JSON 存储不保留 video 结构，因此主路径仍是读 data.video_url）
-    let video: { url: string; duration: number } | undefined;
+    let video: { url: string; duration: number; backupUrls?: string[] } | undefined;
     let hasWatermark = false;
 
     const originKey = data.video?.consumer?.origin_video_key
@@ -545,11 +563,11 @@ export class XiaohongshuService {
       const httpsUrl = this.toHttps(data.video_url);
       video = { url: httpsUrl, duration: 0 };
       hasWatermark = !this.isNoWatermarkVideoUrl(httpsUrl);
-    } else if (data.video?.media?.stream?.h264?.[0]?.master_url) {
+    } else {
       // 兄底：master_url 带水印
-      const videoUrl = this.toHttps(data.video.media.stream.h264[0].master_url);
-      if (videoUrl) {
-        video = { url: videoUrl, duration: data.video.duration || 0 };
+      const streamUrls = this.collectStreamUrls(data.video?.media?.stream);
+      if (streamUrls.length > 0) {
+        video = { url: streamUrls[0], duration: data.video?.duration || 0, backupUrls: streamUrls.slice(1) };
         hasWatermark = true;
       }
     }
@@ -573,10 +591,15 @@ export class XiaohongshuService {
         userId
       },
       images,
+      livePhotos: livePhotos.length > 0 ? livePhotos : undefined,
       video,
       likes: parseMetric(data.liked_count) || parseMetric(data.likes),
       collects: parseMetric(data.collected_count) || parseMetric(data.collects),
       comments: parseMetric(data.comment_count) || parseMetric(data.comments),
+      shares: parseMetric(data.share_count) || parseMetric(data.shares) || parseMetric(data.interactInfo?.shareCount),
+      publishTime: Number(data.time || data.publish_time || data.publishTime || data.last_modify_ts || 0) || undefined,
+      ipLocation: data.ip_location || data.ipLocation || '',
+      tags: this.normalizeTags(data),
       noteUrl,
       creatorUrl,
       // 仅对 video 类型有意义；image 类型固定为 false
@@ -599,15 +622,46 @@ export class XiaohongshuService {
     }
   }
 
+  private collectStreamUrls(stream: any): string[] {
+    const urls: string[] = [];
+    for (const codec of ['h264', 'h265', 'av1', 'h266']) {
+      const value = stream?.[codec];
+      const items = Array.isArray(value) ? value : value ? [value] : [];
+      for (const item of items) {
+        const master = item?.master_url || item?.masterUrl || '';
+        if (typeof master === 'string' && master) urls.push(this.toHttps(this.cleanUrl(master)));
+        const backups = item?.backup_urls || item?.backupUrls || [];
+        if (Array.isArray(backups)) {
+          for (const backup of backups) {
+            if (typeof backup === 'string' && backup) urls.push(this.toHttps(this.cleanUrl(backup)));
+          }
+        }
+      }
+    }
+    return Array.from(new Set(urls));
+  }
+
+  private normalizeTags(data: any): Array<{ id: string; name: string; type: string }> {
+    const rawTags = data?.tagList || data?.tag_list || data?.tags || [];
+    if (!Array.isArray(rawTags)) return [];
+    return rawTags
+      .map((tag: any) => ({
+        id: String(tag?.id || tag?.tag_id || ''),
+        name: String(tag?.name || tag?.tag_name || '').trim(),
+        type: String(tag?.type || ''),
+      }))
+      .filter(tag => tag.name);
+  }
+
   /**
    * 将匿名解析的结果映射为统一的 NoteInfo
    * 与 parseNoteData 不同的是：匿名结果已经是规范化结构，直接搭
    */
   private mapAnonymousToNoteInfo(raw: AnonymousNoteRaw, noteId: string): NoteInfo {
-    let video: { url: string; duration: number } | undefined;
+    let video: { url: string; duration: number; backupUrls?: string[] } | undefined;
     let hasWatermark = false;
     if (raw.video) {
-      video = { url: raw.video.url, duration: raw.video.duration };
+      video = { url: raw.video.url, duration: raw.video.duration, backupUrls: raw.video.backup_urls };
       // 有 origin_video_key 就是无水印；只有 master_url 就是带水印
       hasWatermark = !raw.video.origin_video_key && !this.isNoWatermarkVideoUrl(raw.video.url);
       // 诊断日志：便于将来小红书上新域名时快速呼出
@@ -634,10 +688,21 @@ export class XiaohongshuService {
         userId: raw.user.user_id,
       },
       images: raw.image_list,
+      livePhotos: raw.live_photos?.map(item => ({
+        imageUrl: item.image_url,
+        videoUrl: item.video_url,
+        videoUrls: item.video_urls,
+        index: item.index,
+        duration: item.duration || 0,
+      })),
       video,
       likes: raw.liked_count,
       collects: raw.collected_count,
       comments: raw.comment_count,
+      shares: raw.share_count,
+      publishTime: raw.publish_time,
+      ipLocation: raw.ip_location,
+      tags: raw.tags,
       noteUrl,
       creatorUrl,
       hasWatermark,

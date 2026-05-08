@@ -22,7 +22,7 @@ interface NoteInfo {
   noteUrl?: string;
   creatorUrl?: string;
   hasWatermark?: boolean; // 视频疑似带水印（登录态失效时会为 true）
-  parseMode?: 'anonymous' | 'mediacrawler'; // 数据来源：匿名直解 or MediaCrawler 爬取
+  parseMode?: 'anonymous' | 'mediacrawler'; // 数据来源：匿名直解 or 增强模式
 }
 
 interface LoginStatus {
@@ -49,12 +49,86 @@ interface ProgressInfo {
   elapsedMs: number;
 }
 
+type Notice = {
+  type: 'success' | 'error' | 'info';
+  message: string;
+};
+
+type ErrorTone = 'error' | 'warning' | 'login';
+
+type ErrorSummary = {
+  tone: ErrorTone;
+  title: string;
+  message: string;
+  showLoginAction: boolean;
+};
+
+const classifyErrorMessage = (message: string, needsLogin: boolean): ErrorSummary => {
+  const lower = message.toLowerCase();
+
+  if (needsLogin) {
+    return {
+      tone: 'login',
+      title: '增强模式需要登录',
+      message,
+      showLoginAction: true,
+    };
+  }
+
+  if (message.includes('请输入') || message.includes('链接') || lower.includes('url')) {
+    return {
+      tone: 'warning',
+      title: '链接无法识别',
+      message,
+      showLoginAction: false,
+    };
+  }
+
+  if (message.includes('过期') || message.includes('失效') || lower.includes('expired') || lower.includes('xsec_token')) {
+    return {
+      tone: 'warning',
+      title: '分享链接可能已失效',
+      message,
+      showLoginAction: false,
+    };
+  }
+
+  if (message.includes('频繁') || message.includes('稍后') || lower.includes('rate') || lower.includes('too many')) {
+    return {
+      tone: 'warning',
+      title: '请求过于频繁',
+      message,
+      showLoginAction: false,
+    };
+  }
+
+  if (message.includes('网络') || message.includes('服务') || lower.includes('network') || lower.includes('fetch')) {
+    return {
+      tone: 'error',
+      title: '服务连接异常',
+      message,
+      showLoginAction: false,
+    };
+  }
+
+  return {
+    tone: 'error',
+    title: '解析没有完成',
+    message,
+    showLoginAction: false,
+  };
+};
+
 function App() {
   const [mode, setMode] = useState<Mode>('parse');
   const [url, setUrl] = useState('');
   const [keywords, setKeywords] = useState('');
   const [loading, setLoading] = useState(false);
+  const [batchDownloading, setBatchDownloading] = useState(false);
+  const [noteDownloading, setNoteDownloading] = useState(false);
   const [error, setError] = useState('');
+  const [errorNeedsLogin, setErrorNeedsLogin] = useState(false);
+  const [notice, setNotice] = useState<Notice | null>(null);
   const [noteInfo, setNoteInfo] = useState<NoteInfo | null>(null);
   const [noteList, setNoteList] = useState<NoteInfo[]>([]);
   const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
@@ -69,6 +143,9 @@ function App() {
   // 本次搜索/博主任务的目标值，任务结束后仍保留，用于在结果页提示「目标 X / 实际 Y」
   const [lastSearchTarget, setLastSearchTarget] = useState<number>(0);
   const progressTimerRef = useRef<number | null>(null);
+  const noticeTimerRef = useRef<number | null>(null);
+  const loginPollTimerRef = useRef<number | null>(null);
+  const requestInFlightRef = useRef(false);
   const searchStartTsRef = useRef<number>(0);
 
   // 优先用环境变量（开发态推荐设为 http://localhost:3001 连本地后端）；
@@ -85,15 +162,26 @@ function App() {
     return `${API_BASE}/api/proxy/${type}?url=${encodeURIComponent(url)}`;
   }, [API_BASE]);
 
+  const showNotice = useCallback((type: Notice['type'], message: string) => {
+    if (noticeTimerRef.current !== null) {
+      window.clearTimeout(noticeTimerRef.current);
+    }
+    setNotice({ type, message });
+    noticeTimerRef.current = window.setTimeout(() => {
+      setNotice(null);
+      noticeTimerRef.current = null;
+    }, 4000);
+  }, []);
+
   // 检查登录状态
   const checkLoginStatus = useCallback(async () => {
     try {
       const response = await fetch(`${API_BASE}/api/login-status`);
       const data = await response.json();
-      if (data.success) {
+      if (data.data) {
         setLoginStatus(data.data);
       }
-    } catch (err) {
+    } catch {
       setLoginStatus({
         mediaCrawlerRunning: false,
         loginValid: false,
@@ -104,11 +192,30 @@ function App() {
 
   // 初始化时检查登录状态
   useEffect(() => {
-    checkLoginStatus();
+    const initialTimer = window.setTimeout(checkLoginStatus, 0);
     // 每 10 秒刷新一次状态，让右上角徽章更快反应登录/注销的变化
-    const interval = setInterval(checkLoginStatus, 10000);
-    return () => clearInterval(interval);
+    const interval = window.setInterval(checkLoginStatus, 10000);
+    return () => {
+      window.clearTimeout(initialTimer);
+      window.clearInterval(interval);
+    };
   }, [checkLoginStatus]);
+
+  useEffect(() => {
+    return () => {
+      if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
+      if (loginPollTimerRef.current !== null) window.clearInterval(loginPollTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!showLoginModal) return;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') setShowLoginModal(false);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [showLoginModal]);
 
   // 触发登录
   const handleLogin = async () => {
@@ -117,10 +224,13 @@ function App() {
       const response = await fetch(`${API_BASE}/api/login`, { method: 'POST' });
       const data = await response.json();
       if (data.success) {
-        alert(data.message);
+        showNotice('info', data.message || '请在弹出的浏览器窗口中扫码登录');
         // 登录期间高频轮询：每 3 秒试一次，最长 2 分钟；成功即止
         let tries = 0;
-        const timer = setInterval(async () => {
+        if (loginPollTimerRef.current !== null) {
+          window.clearInterval(loginPollTimerRef.current);
+        }
+        loginPollTimerRef.current = window.setInterval(async () => {
           tries++;
           try {
             const r = await fetch(`${API_BASE}/api/login-status`);
@@ -128,18 +238,27 @@ function App() {
             if (j.success && j.data?.loginValid) {
               setLoginStatus(j.data);
               setShowLoginModal(false);
-              clearInterval(timer);
+              showNotice('success', '登录成功，可以使用搜索和博主模式了');
+              if (loginPollTimerRef.current !== null) {
+                window.clearInterval(loginPollTimerRef.current);
+                loginPollTimerRef.current = null;
+              }
               return;
             }
-            setLoginStatus(j.data || loginStatus);
-          } catch {}
-          if (tries >= 40) clearInterval(timer); // 40 * 3s = 2min
+            if (j.data) setLoginStatus(j.data);
+          } catch {
+            // 登录轮询失败不阻断用户继续扫码。
+          }
+          if (tries >= 40 && loginPollTimerRef.current !== null) {
+            window.clearInterval(loginPollTimerRef.current);
+            loginPollTimerRef.current = null;
+          }
         }, 3000);
       } else {
-        alert(data.message + '\n\n' + data.hint);
+        showNotice('error', [data.message, data.hint].filter(Boolean).join('：'));
       }
-    } catch (err) {
-      alert('启动登录失败，请手动运行 MediaCrawler 进行登录');
+    } catch {
+      showNotice('error', '启动增强模式失败，请检查本地服务是否正常');
     } finally {
       setLoginLoading(false);
     }
@@ -147,7 +266,7 @@ function App() {
 
   // 退出登录：调用后端清掉 Cookies 文件后刷新状态
   const handleLogout = async () => {
-    if (!confirm('确定要退出当前登录吗？\n退出后需要重新扫码才能使用搜索/博主模式。')) {
+    if (!window.confirm('确定要退出当前登录吗？\n退出后需要重新扫码才能使用搜索/博主模式。')) {
       return;
     }
     setLoginLoading(true);
@@ -155,14 +274,14 @@ function App() {
       const response = await fetch(`${API_BASE}/api/logout`, { method: 'POST' });
       const data = await response.json();
       if (data.success) {
-        alert(data.message || '已退出登录');
+        showNotice('success', data.message || '已退出登录');
         await checkLoginStatus();
         setShowLoginModal(false);
       } else {
-        alert((data.message || '退出失败') + (data.hint ? '\n\n' + data.hint : ''));
+        showNotice('error', [data.message || '退出失败', data.hint].filter(Boolean).join('：'));
       }
-    } catch (err) {
-      alert('退出登录请求失败，请检查后端服务是否正常');
+    } catch {
+      showNotice('error', '退出登录请求失败，请检查后端服务是否正常');
     } finally {
       setLoginLoading(false);
     }
@@ -170,9 +289,16 @@ function App() {
 
   // 检查错误是否是登录相关
   // 优先信任后端明确的 needLogin 字段；其次按关键词兑底
-  const checkLoginError = (errorMsg: string, payload?: { needLogin?: boolean }) => {
+  const checkLoginError = useCallback((
+    errorMsg: string,
+    payload?: { needLogin?: boolean },
+    options: { openModal?: boolean } = {},
+  ) => {
+    const openModal = options.openModal ?? true;
     if (payload?.needLogin === true) {
-      setShowLoginModal(true);
+      if (openModal) {
+        setShowLoginModal(true);
+      }
       // 弹出后立即刷新一次状态，让弹框内的文案更准确
       checkLoginStatus();
       return true;
@@ -181,12 +307,11 @@ function App() {
     const isLoginError = loginKeywords.some(keyword =>
       errorMsg.toLowerCase().includes(keyword.toLowerCase())
     );
-    if (isLoginError) {
+    if (isLoginError && openModal) {
       setShowLoginModal(true);
-      return true;
     }
-    return false;
-  };
+    return isLoginError;
+  }, [checkLoginStatus]);
 
   // 计算分页数据
   const totalPages = Math.ceil(noteList.length / PAGE_SIZE);
@@ -248,13 +373,18 @@ function App() {
 
   // 解析单个笔记
   const handleParse = useCallback(async () => {
-    if (!url.trim()) {
+    if (requestInFlightRef.current) return;
+    const nextUrl = url.trim();
+    if (!nextUrl) {
       setError('请输入小红书链接');
+      setErrorNeedsLogin(false);
       return;
     }
 
+    requestInFlightRef.current = true;
     setLoading(true);
     setError('');
+    setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
     setSelectedNotes(new Set());
@@ -264,7 +394,7 @@ function App() {
       const response = await fetch(`${API_BASE}/api/parse`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url }),
+        body: JSON.stringify({ url: nextUrl }),
       });
 
       const data = await response.json();
@@ -272,25 +402,34 @@ function App() {
       if (data.success) {
         setNoteInfo(data.data);
       } else {
-        setError(data.message || '解析失败');
-        checkLoginError(data.message || '', data);
+        const message = data.message || '解析失败';
+        const needsLogin = checkLoginError(message, data, { openModal: false });
+        setError(message);
+        setErrorNeedsLogin(needsLogin);
       }
-    } catch (err) {
+    } catch {
       setError('网络错误，请检查后端服务是否启动');
+      setErrorNeedsLogin(false);
     } finally {
+      requestInFlightRef.current = false;
       setLoading(false);
     }
-  }, [url, API_BASE]);
+  }, [url, API_BASE, checkLoginError]);
 
   // 搜索笔记
   const handleSearch = useCallback(async () => {
-    if (!keywords.trim()) {
+    if (requestInFlightRef.current) return;
+    const nextKeywords = keywords.trim();
+    if (!nextKeywords) {
       setError('请输入搜索关键词');
+      setErrorNeedsLogin(false);
       return;
     }
 
+    requestInFlightRef.current = true;
     setLoading(true);
     setError('');
+    setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
     setSelectedNotes(new Set());
@@ -298,13 +437,13 @@ function App() {
     setLastSearchTarget(targetCount);
 
     // 启动进度轮询
-    startProgressPolling('search', keywords.trim());
+    startProgressPolling('search', nextKeywords);
 
     try {
       const response = await fetch(`${API_BASE}/api/search`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ keywords, maxCount: targetCount }),
+        body: JSON.stringify({ keywords: nextKeywords, maxCount: targetCount }),
       });
 
       const data = await response.json();
@@ -315,27 +454,36 @@ function App() {
         const firstPageNotes = data.data.slice(0, PAGE_SIZE);
         setSelectedNotes(new Set(firstPageNotes.map((n: NoteInfo) => n.noteId)));
       } else {
-        setError(data.message || '搜索失败');
-        checkLoginError(data.message || '', data);
+        const message = data.message || '搜索失败';
+        const needsLogin = checkLoginError(message, data);
+        setError(message);
+        setErrorNeedsLogin(needsLogin);
       }
-    } catch (err) {
+    } catch {
       setError('网络错误，请检查后端服务是否启动');
+      setErrorNeedsLogin(false);
     } finally {
+      requestInFlightRef.current = false;
       stopProgressPolling();
       setProgress(null);
       setLoading(false);
     }
-  }, [keywords, targetCount, API_BASE, startProgressPolling, stopProgressPolling]);
+  }, [keywords, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError]);
 
   // 获取博主笔记
   const handleCreator = useCallback(async () => {
-    if (!url.trim()) {
+    if (requestInFlightRef.current) return;
+    const nextUrl = url.trim();
+    if (!nextUrl) {
       setError('请输入博主主页链接');
+      setErrorNeedsLogin(false);
       return;
     }
 
+    requestInFlightRef.current = true;
     setLoading(true);
     setError('');
+    setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
     setSelectedNotes(new Set());
@@ -343,15 +491,15 @@ function App() {
     setLastSearchTarget(targetCount);
 
     // 从 URL 中提取 userId 用于 progress 轮询
-    const userIdMatch = url.match(/user\/profile\/([a-zA-Z0-9]+)/);
-    const userIdForProgress = userIdMatch ? userIdMatch[1] : url.trim();
+    const userIdMatch = nextUrl.match(/user\/profile\/([a-zA-Z0-9]+)/);
+    const userIdForProgress = userIdMatch ? userIdMatch[1] : nextUrl;
     startProgressPolling('creator', userIdForProgress);
 
     try {
       const response = await fetch(`${API_BASE}/api/creator`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ url, maxCount: targetCount }),
+        body: JSON.stringify({ url: nextUrl, maxCount: targetCount }),
       });
 
       const data = await response.json();
@@ -362,24 +510,84 @@ function App() {
         const firstPageNotes = data.data.slice(0, PAGE_SIZE);
         setSelectedNotes(new Set(firstPageNotes.map((n: NoteInfo) => n.noteId)));
       } else {
-        setError(data.message || '获取失败');
-        checkLoginError(data.message || '', data);
+        const message = data.message || '获取失败';
+        const needsLogin = checkLoginError(message, data);
+        setError(message);
+        setErrorNeedsLogin(needsLogin);
       }
-    } catch (err) {
+    } catch {
       setError('网络错误，请检查后端服务是否启动');
+      setErrorNeedsLogin(false);
     } finally {
+      requestInFlightRef.current = false;
       stopProgressPolling();
       setProgress(null);
       setLoading(false);
     }
-  }, [url, targetCount, API_BASE, startProgressPolling, stopProgressPolling]);
+  }, [url, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError]);
 
   const handleDownload = useCallback((downloadUrl: string, filename: string) => {
     const link = document.createElement('a');
     link.href = `${API_BASE}/api/download?url=${encodeURIComponent(downloadUrl)}`;
     link.download = filename;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
     link.click();
+    link.remove();
   }, [API_BASE]);
+
+  const handleDownloadNoteImages = useCallback(async (note: NoteInfo) => {
+    if (note.images.length <= 1) {
+      if (note.images[0]) {
+        handleDownload(note.images[0], `image_${note.noteId}_1.jpg`);
+      }
+      return;
+    }
+
+    setNoteDownloading(true);
+    setError('');
+    setErrorNeedsLogin(false);
+    try {
+      const response = await fetch(`${API_BASE}/api/download-zip`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ notes: [note] }),
+      });
+
+      if (!response.ok) {
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.message || '打包下载失败');
+      }
+
+      const blob = await response.blob();
+      const downloadUrl = window.URL.createObjectURL(blob);
+      const link = document.createElement('a');
+      link.href = downloadUrl;
+      link.download = `xiaohongshu_${note.noteId || Date.now()}.zip`;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
+      showNotice('success', `已开始打包下载 ${note.images.length} 张图片`);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '打包下载失败';
+      setError(message);
+      setErrorNeedsLogin(false);
+      showNotice('error', message);
+    } finally {
+      setNoteDownloading(false);
+    }
+  }, [API_BASE, handleDownload, showNotice]);
+
+  const handleCopyUrl = useCallback(async (noteUrl: string) => {
+    try {
+      await navigator.clipboard.writeText(noteUrl);
+      showNotice('success', '已复制原地址');
+    } catch {
+      showNotice('error', '复制失败，请手动复制链接');
+    }
+  }, [showNotice]);
 
   const formatNumber = (num: number): string => {
     if (num >= 10000) {
@@ -422,9 +630,13 @@ function App() {
     const selectedList = noteList.filter(n => selectedNotes.has(n.noteId));
     if (selectedList.length === 0) {
       setError('请选择要下载的笔记');
+      setErrorNeedsLogin(false);
       return;
     }
 
+    setBatchDownloading(true);
+    setError('');
+    setErrorNeedsLogin(false);
     try {
       const response = await fetch(`${API_BASE}/api/download-zip`, {
         method: 'POST',
@@ -433,7 +645,8 @@ function App() {
       });
 
       if (!response.ok) {
-        throw new Error('下载失败');
+        const payload = await response.json().catch(() => null);
+        throw new Error(payload?.message || '下载失败');
       }
 
       const blob = await response.blob();
@@ -441,10 +654,19 @@ function App() {
       const link = document.createElement('a');
       link.href = downloadUrl;
       link.download = `xiaohongshu_${Date.now()}.zip`;
+      link.rel = 'noopener';
+      document.body.appendChild(link);
       link.click();
-      window.URL.revokeObjectURL(downloadUrl);
+      link.remove();
+      window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
+      showNotice('success', `已开始打包下载 ${selectedList.length} 条笔记`);
     } catch (err) {
-      console.error('批量下载失败:', err);
+      const message = err instanceof Error ? err.message : '批量下载失败';
+      setError(message);
+      setErrorNeedsLogin(false);
+      showNotice('error', message);
+    } finally {
+      setBatchDownloading(false);
     }
   };
 
@@ -452,6 +674,8 @@ function App() {
   const handlePageChange = (page: number) => {
     setCurrentPage(page);
   };
+
+  const currentError = error ? classifyErrorMessage(error, errorNeedsLogin) : null;
 
   return (
     <div className="app">
@@ -463,32 +687,47 @@ function App() {
             <span className="logo-text">小红书无水印下载</span>
           </div>
           {/* 登录状态指示器 */}
-          <div className="login-status-indicator" onClick={() => setShowLoginModal(true)}>
+          <button
+            type="button"
+            className="login-status-indicator"
+            onClick={() => setShowLoginModal(true)}
+            aria-label="查看增强模式登录状态"
+          >
             {loginStatus ? (
               loginStatus.loginValid ? (
-                <span className="status-badge valid">✓ 已登录</span>
+                <span className="status-badge valid">✓ 增强模式已登录</span>
               ) : (
-                <span className="status-badge invalid">✗ 未登录</span>
+                <span className="status-badge invalid">增强模式待登录</span>
               )
             ) : (
               <span className="status-badge checking">检查中...</span>
             )}
-          </div>
+          </button>
         </div>
       </header>
+
+      {notice && (
+        <div className={`app-notice ${notice.type}`} role="status" aria-live="polite">
+          {notice.message}
+        </div>
+      )}
 
       {/* 登录提示弹窗 */}
       {showLoginModal && (
         <div className="login-modal-overlay" onClick={() => setShowLoginModal(false)}>
-          <div className="login-modal" onClick={e => e.stopPropagation()}>
-            <h3>🔐 登录状态</h3>
+          <div
+            className="login-modal"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="login-modal-title"
+            onClick={e => e.stopPropagation()}
+          >
+            <h3 id="login-modal-title">🔐 增强模式登录状态</h3>
+            <p className="login-mode-note">
+              普通分享链接解析通常无需登录；关键词搜索、博主笔记和登录解析会使用增强模式。
+            </p>
             {loginStatus ? (
               <>
-                <div className={`login-status-detail ${loginStatus.loginValid ? 'valid' : 'invalid'}`}>
-                  <p><strong>服务状态:</strong> {loginStatus.mediaCrawlerRunning ? '✓ 运行中' : '✗ 未运行'}</p>
-                  <p><strong>登录状态:</strong> {loginStatus.loginMessage}</p>
-                  {loginStatus.hint && <p className="hint">{loginStatus.hint}</p>}
-                </div>
                 {!loginStatus.loginValid ? (
                   <div className="login-actions">
                     <button
@@ -499,7 +738,7 @@ function App() {
                       {loginLoading ? '启动中...' : '📱 扫码登录'}
                     </button>
                     <p className="login-tip">
-                      点击后将弹出浏览器窗口，请使用小红书App扫码登录
+                      点击后将弹出浏览器窗口，请使用小红书 App 扫码登录增强模式
                     </p>
                   </div>
                 ) : (
@@ -512,7 +751,7 @@ function App() {
                       {loginLoading ? '处理中...' : '🚪 退出登录'}
                     </button>
                     <p className="login-tip">
-                      退出后将清除本地登录凭证，下次需要重新扫码
+                      退出后将清除本地增强模式凭证，下次需要重新扫码
                     </p>
                   </div>
                 )}
@@ -538,16 +777,17 @@ function App() {
 
           {/* Mode Tabs */}
           <div className="mode-tabs">
-            <button className={`mode-tab ${mode === 'parse' ? 'active' : ''}`} onClick={() => setMode('parse')}>
+            <button className={`mode-tab ${mode === 'parse' ? 'active' : ''}`} onClick={() => setMode('parse')} aria-pressed={mode === 'parse'}>
               📄 解析链接
             </button>
-            <button className={`mode-tab ${mode === 'creator' ? 'active' : ''}`} onClick={() => setMode('creator')}>
+            <button className={`mode-tab ${mode === 'creator' ? 'active' : ''}`} onClick={() => setMode('creator')} aria-pressed={mode === 'creator'}>
               👤 博主笔记
             </button>
             <button
               className={`mode-tab experimental ${mode === 'search' ? 'active' : ''}`}
               onClick={() => setMode('search')}
               title="实验性功能：小红书原生搜索体验更佳，此处仅适合批量存档场景"
+              aria-pressed={mode === 'search'}
             >
               🔍 关键词搜索 <span className="experimental-tag">实验性</span>
             </button>
@@ -561,9 +801,10 @@ function App() {
                   type="text"
                   className="url-input"
                   placeholder="粘贴小红书笔记链接或完整分享文案"
+                  aria-label="小红书笔记链接或完整分享文案"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  onKeyPress={(e) => e.key === 'Enter' && handleParse()}
+                  onKeyDown={(e) => e.key === 'Enter' && !loading && handleParse()}
                 />
                 <button className="parse-btn" onClick={handleParse} disabled={loading}>
                   {loading ? <span className="loading-spinner"></span> : '解析'}
@@ -577,13 +818,15 @@ function App() {
                   type="text"
                   className="url-input"
                   placeholder="输入搜索关键词，如：美食 旅游 化妆"
+                  aria-label="搜索关键词"
                   value={keywords}
                   onChange={(e) => setKeywords(e.target.value)}
-                  onKeyPress={(e) => e.key === 'Enter' && handleSearch()}
+                  onKeyDown={(e) => e.key === 'Enter' && !loading && handleSearch()}
                 />
                 <select
                   className="count-input count-select"
                   title="目标笔记数量（小红书单页最小 20 条，按 20 的倍数选择）"
+                  aria-label="目标笔记数量"
                   value={targetCount}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
@@ -607,13 +850,15 @@ function App() {
                   type="text"
                   className="url-input"
                   placeholder="粘贴博主主页链接或完整分享文案"
+                  aria-label="博主主页链接或完整分享文案"
                   value={url}
                   onChange={(e) => setUrl(e.target.value)}
-                  onKeyPress={(e) => e.key === 'Enter' && handleCreator()}
+                  onKeyDown={(e) => e.key === 'Enter' && !loading && handleCreator()}
                 />
                 <select
                   className="count-input count-select"
                   title="目标笔记数量（小红书单页最小 20 条，按 20 的倍数选择）"
+                  aria-label="目标笔记数量"
                   value={targetCount}
                   onChange={(e) => {
                     const v = parseInt(e.target.value, 10);
@@ -692,13 +937,16 @@ function App() {
           </div>
 
           {/* Error Message */}
-          {error && (
-            <div className="error-message">
+          {currentError && (
+            <div className={`error-message ${currentError.tone}`} role="alert">
               <span className="error-icon">⚠️</span>
-              {error}
-              {error.includes('权限') || error.includes('登录') ? (
+              <div className="error-copy">
+                <strong>{currentError.title}</strong>
+                <span>{currentError.message}</span>
+              </div>
+              {currentError.showLoginAction ? (
                 <button className="error-login-btn" onClick={() => setShowLoginModal(true)}>
-                  去登录
+                  打开增强模式
                 </button>
               ) : null}
             </div>
@@ -710,6 +958,8 @@ function App() {
           <section className="result-section">
             <div className="author-info">
               <img src={noteInfo.author.avatar} alt={noteInfo.author.nickname} className="author-avatar"
+                loading="lazy"
+                decoding="async"
                 onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/48'; }} />
               <span className="author-name">{noteInfo.author.nickname}</span>
               {noteInfo.parseMode && (
@@ -717,9 +967,9 @@ function App() {
                   className={`parse-mode-badge ${noteInfo.parseMode}`}
                   title={noteInfo.parseMode === 'anonymous'
                     ? '通过直接解析小红书 HTML 获得，无需登录'
-                    : '通过 MediaCrawler 登录后爬取获得'}
+                    : '通过增强模式获得'}
                 >
-                  {noteInfo.parseMode === 'anonymous' ? '🚀 匿名直解' : '🔐 登录解析'}
+                  {noteInfo.parseMode === 'anonymous' ? '🚀 匿名直解' : '🔐 增强模式解析'}
                 </span>
               )}
             </div>
@@ -729,6 +979,47 @@ function App() {
               <span>❤️ {formatNumber(noteInfo.likes)}</span>
               <span>⭐ {formatNumber(noteInfo.collects)}</span>
               <span>💬 {formatNumber(noteInfo.comments)}</span>
+            </div>
+            <div className="result-toolbar">
+              <div className="result-summary">
+                <span className="media-type-pill">
+                  {noteInfo.type === 'video' ? '视频' : '图集'} · {noteInfo.type === 'video' ? '1 个文件' : `${noteInfo.images.length} 张图片`}
+                </span>
+                {noteInfo.type === 'video' && (
+                  <span className={`watermark-pill ${noteInfo.hasWatermark ? 'warning' : 'ok'}`}>
+                    {noteInfo.hasWatermark ? '视频源可能带水印' : '视频源无水印'}
+                  </span>
+                )}
+              </div>
+              <div className="result-actions">
+                {noteInfo.noteUrl && (
+                  <button className="secondary-action-btn" onClick={() => handleCopyUrl(noteInfo.noteUrl!)}>
+                    复制原文链接
+                  </button>
+                )}
+                {noteInfo.creatorUrl && (
+                  <a className="secondary-action-btn" href={noteInfo.creatorUrl} target="_blank" rel="noreferrer">
+                    打开博主
+                  </a>
+                )}
+                {noteInfo.type === 'video' && noteInfo.video ? (
+                  <button className="primary-action-btn" onClick={() => handleDownload(noteInfo.video!.url, `video_${noteInfo.noteId}.mp4`)}>
+                    下载视频
+                  </button>
+                ) : noteInfo.images.length > 0 ? (
+                  <button
+                    className="primary-action-btn"
+                    onClick={() => handleDownloadNoteImages(noteInfo)}
+                    disabled={noteDownloading}
+                  >
+                    {noteDownloading
+                      ? '打包中...'
+                      : noteInfo.images.length > 1
+                        ? `打包下载图片 (${noteInfo.images.length})`
+                        : '下载图片'}
+                  </button>
+                ) : null}
+              </div>
             </div>
             <div className="media-section">
               {noteInfo.type === 'video' && noteInfo.video ? (
@@ -754,15 +1045,14 @@ function App() {
                     preload="metadata"
                     playsInline
                   />
-                  <button className="download-btn video-download" onClick={() => handleDownload(noteInfo.video!.url, `video_${noteInfo.noteId}.mp4`)}>
-                    📥 下载视频
-                  </button>
                 </div>
               ) : (
                 <div className="images-grid">
                   {noteInfo.images.map((img, index) => (
                     <div key={index} className="image-item">
                       <img src={getProxyUrl(img, 'image')} alt={`图片 ${index + 1}`} className="preview-image"
+                        loading="lazy"
+                        decoding="async"
                         onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/400x500?text=加载失败'; }} />
                       <button className="download-btn" onClick={() => handleDownload(img, `image_${noteInfo.noteId}_${index + 1}.jpg`)}>
                         📥 下载图片 {index + 1}
@@ -772,15 +1062,6 @@ function App() {
                 </div>
               )}
             </div>
-            {noteInfo.type === 'image' && noteInfo.images.length > 1 && (
-              <button className="download-all-btn" onClick={() => {
-                noteInfo.images.forEach((img, index) => {
-                  setTimeout(() => handleDownload(img, `image_${noteInfo.noteId}_${index + 1}.jpg`), index * 500);
-                });
-              }}>
-                📦 一键下载全部图片 ({noteInfo.images.length}张)
-              </button>
-            )}
           </section>
         )}
 
@@ -794,6 +1075,7 @@ function App() {
                     type="checkbox"
                     checked={paginatedNotes.every(n => selectedNotes.has(n.noteId))}
                     onChange={handleSelectAllPage}
+                    aria-label="选择或取消选择本页笔记"
                   />
                   <span>本页全选</span>
                 </label>
@@ -806,8 +1088,8 @@ function App() {
                   </span>
                 )}
               </div>
-              <button className="download-all-btn" onClick={handleBatchDownload} disabled={selectedNotes.size === 0}>
-                📦 打包下载 ({selectedNotes.size})
+              <button className="download-all-btn" onClick={handleBatchDownload} disabled={selectedNotes.size === 0 || batchDownloading}>
+                {batchDownloading ? '打包中...' : `📦 打包下载 (${selectedNotes.size})`}
               </button>
             </div>
 
@@ -829,6 +1111,7 @@ function App() {
                       type="checkbox"
                       checked={selectedNotes.has(note.noteId)}
                       onChange={() => handleToggleSelect(note.noteId)}
+                      aria-label={`选择笔记 ${note.title || note.noteId || idx + 1}`}
                     />
                   </div>
                   <div className="col-type">
@@ -844,7 +1127,7 @@ function App() {
                         src={getProxyUrl(note.video.url, 'video')}
                         className="table-video-preview"
                         controls
-                        preload="metadata"
+                        preload="none"
                         playsInline
                         poster={getProxyUrl(note.images[0], 'image')}
                       />
@@ -853,6 +1136,8 @@ function App() {
                         src={getProxyUrl(note.images[0], 'image')}
                         alt="预览"
                         className="table-image-preview"
+                        loading="lazy"
+                        decoding="async"
                         onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/60x80?text=加载失败'; }}
                       />
                     ) : (
@@ -868,6 +1153,8 @@ function App() {
                       src={getProxyUrl(note.author.avatar, 'image')}
                       alt={note.author.nickname}
                       className="table-avatar"
+                      loading="lazy"
+                      decoding="async"
                       onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/32'; }}
                     />
                     <span className="table-author-name">{note.author.nickname}</span>
@@ -881,10 +1168,9 @@ function App() {
                       {note.noteUrl && (
                         <button
                           className="action-btn copy-btn"
-                          onClick={() => {
-                            navigator.clipboard.writeText(note.noteUrl!);
-                          }}
+                          onClick={() => handleCopyUrl(note.noteUrl!)}
                           title="复制原地址"
+                          aria-label="复制原地址"
                         >
                           📋
                         </button>
@@ -897,6 +1183,7 @@ function App() {
                             setMode('creator');
                           }}
                           title="查看博主"
+                          aria-label="查看博主"
                         >
                           👤
                         </button>
@@ -906,6 +1193,7 @@ function App() {
                           className="action-btn download-btn-table"
                           onClick={() => handleDownload(note.video!.url, `video_${note.noteId}.mp4`)}
                           title="下载视频"
+                          aria-label="下载视频"
                         >
                           📥
                         </button>
@@ -918,6 +1206,7 @@ function App() {
                             });
                           }}
                           title="下载图片"
+                          aria-label="下载图片"
                         >
                           📥
                         </button>

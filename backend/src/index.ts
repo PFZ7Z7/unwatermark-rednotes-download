@@ -5,7 +5,6 @@ import archiver from 'archiver';
 import path from 'path';
 import fs from 'fs';
 import { XiaohongshuService, LoginRequiredError, detectLoginState } from './services/xiaohongshu';
-import { runWithConcurrency } from './utils/perf';
 import axios from 'axios';
 
 dotenv.config();
@@ -33,15 +32,23 @@ function sendError(res: Response, err: any, fallbackStatus = 500) {
 }
 
 // 代理域名白名单，防止被当作公共代理滥用
-const PROXY_ALLOWED_HOSTS = (process.env.PROXY_ALLOWED_HOSTS || 'xhscdn.com,xiaohongshu.com,xhslink.com')
+const PROXY_ALLOWED_HOSTS = (process.env.PROXY_ALLOWED_HOSTS || 'xhscdn.com,xhscdn.net,xiaohongshu.com,xhslink.com')
   .split(',')
-  .map(h => h.trim())
+  .map(h => h.trim().toLowerCase())
   .filter(Boolean);
+
+const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '1mb';
+const MAX_ZIP_ITEMS = Math.max(1, Number(process.env.MAX_ZIP_ITEMS || 500));
+const RUNTIME_CLEANUP_INTERVAL_MS = Math.max(
+  60_000,
+  Number(process.env.RUNTIME_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000)
+);
 
 function isAllowedProxyUrl(rawUrl: string): boolean {
   try {
     const u = new URL(rawUrl);
     if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+    if (u.username || u.password) return false;
     const host = u.hostname.toLowerCase();
     return PROXY_ALLOWED_HOSTS.some(allow => host === allow || host.endsWith('.' + allow));
   } catch {
@@ -53,14 +60,56 @@ function isAllowedProxyUrl(rawUrl: string): boolean {
 // 兼容多种参数顺序，匹配到就替换为 ***（保留参数本身用于排查）
 function redactUrl(url: string): string {
   if (!url) return url;
-  return String(url).replace(/(xsec_token=)[^&#]+/gi, '$1***');
+  return String(url).replace(/((?:xsec_token|web_session|token|sign)=)[^&#]+/gi, '$1***');
+}
+
+function sanitizeFileSegment(value: unknown, fallback: string): string {
+  const cleaned = String(value || fallback)
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, '_')
+    .replace(/^\.+$/g, '_')
+    .slice(0, 80)
+    .trim();
+  return cleaned || fallback;
+}
+
+function createUniqueFilename(filename: string, used: Set<string>): string {
+  if (!used.has(filename)) {
+    used.add(filename);
+    return filename;
+  }
+  const ext = path.extname(filename);
+  const base = filename.slice(0, filename.length - ext.length);
+  let i = 2;
+  while (used.has(`${base}_${i}${ext}`)) i++;
+  const next = `${base}_${i}${ext}`;
+  used.add(next);
+  return next;
+}
+
+function waitForReadableEnd(stream: NodeJS.ReadableStream): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      stream.off('end', onEnd);
+      stream.off('error', onError);
+    };
+    const onEnd = () => {
+      cleanup();
+      resolve();
+    };
+    const onError = (err: Error) => {
+      cleanup();
+      reject(err);
+    };
+    stream.once('end', onEnd);
+    stream.once('error', onError);
+  });
 }
 
 // CORS 白名单：生产环境通过 ALLOWED_ORIGINS 注入；同源 Nginx 反代场景下会留空，
 // 此时不会出现跨域请求（同域），保留白名单仅作纵深防御。
 // 开发态默认允许 Vite dev server (5173) 和 backend 本身 (3001)
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS
-  || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:3001')
+  || 'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,http://127.0.0.1:5174,http://localhost:3001,http://127.0.0.1:3001')
   .split(',')
   .map(s => s.trim())
   .filter(Boolean);
@@ -74,9 +123,28 @@ app.use(cors({
   },
   credentials: true,
 }));
-app.use(express.json());
+app.use((req: Request, res: Response, next) => {
+  res.setHeader('X-Content-Type-Options', 'nosniff');
+  res.setHeader('Referrer-Policy', 'no-referrer');
+  res.setHeader('X-Frame-Options', 'DENY');
+  next();
+});
+app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const xhsService = new XiaohongshuService();
+
+function runRuntimeCleanup(reason: string) {
+  try {
+    xhsService.cleanupRuntimeDataRetention(reason);
+  } catch (e: any) {
+    console.warn(`[保洁] 运行失败（已忽略）: ${e.message}`);
+  }
+}
+
+const cleanupStartupTimer = setTimeout(() => runRuntimeCleanup('startup'), 10_000);
+cleanupStartupTimer.unref?.();
+const cleanupInterval = setInterval(() => runRuntimeCleanup('interval'), RUNTIME_CLEANUP_INTERVAL_MS);
+cleanupInterval.unref?.();
 
 // 当前任务ID（用于取消旧任务）
 let currentTaskId = 0;
@@ -352,7 +420,7 @@ app.get('/api/proxy/video', async (req: Request, res: Response) => {
       return res.status(403).json({ success: false, message: '禁止代理白名单外的域名' });
     }
 
-    console.log(`[代理] 视频请求: ${url.substring(0, 100)}...`);
+    console.log(`[代理] 视频请求: ${redactUrl(url).substring(0, 100)}...`);
 
     const response = await axios.get(url, {
       responseType: 'stream',
@@ -452,18 +520,22 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
 
     // 收集所有下载URL（同时过滤白名单外的链接）
     const downloadItems: { url: string; filename: string }[] = [];
+    const usedFilenames = new Set<string>();
     for (const note of notes) {
+      const noteId = sanitizeFileSegment(note?.noteId, 'note');
       if (note.type === 'video' && note.video?.url && isAllowedProxyUrl(note.video.url)) {
+        const filename = createUniqueFilename(`${noteId}_video.mp4`, usedFilenames);
         downloadItems.push({
           url: note.video.url,
-          filename: `${note.noteId}_video.mp4`
+          filename
         });
       } else if (note.images && note.images.length > 0) {
         note.images.forEach((img: string, idx: number) => {
           if (isAllowedProxyUrl(img)) {
+            const filename = createUniqueFilename(`${noteId}_img${idx + 1}.jpg`, usedFilenames);
             downloadItems.push({
               url: img,
-              filename: `${note.noteId}_img${idx + 1}.jpg`
+              filename
             });
           }
         });
@@ -474,39 +546,54 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
       return res.status(400).json({ success: false, message: '没有可下载的内容' });
     }
 
+    if (downloadItems.length > MAX_ZIP_ITEMS) {
+      return res.status(413).json({
+        success: false,
+        message: `一次最多打包 ${MAX_ZIP_ITEMS} 个文件，请减少选择数量或调整 MAX_ZIP_ITEMS`
+      });
+    }
+
     // 设置响应头
     res.setHeader('Content-Type', 'application/zip');
     res.setHeader('Content-Disposition', `attachment; filename="xiaohongshu_${Date.now()}.zip"`);
 
     // 创建zip流
     const archive = archiver('zip', { zlib: { level: 9 } });
+    archive.on('warning', (err) => {
+      console.warn(`[打包] ZIP 警告: ${err.message}`);
+    });
+    archive.on('error', (err) => {
+      console.error(`[打包] ZIP 错误: ${err.message}`);
+      if (!res.destroyed) res.destroy(err);
+    });
     archive.pipe(res);
 
-    // 并发下载（默认 5 路并发，可通过 DOWNLOAD_CONCURRENCY 调整）
-    const concurrency = Math.max(1, Number(process.env.DOWNLOAD_CONCURRENCY || 5));
-    const buffers = await runWithConcurrency(downloadItems, concurrency, async (item) => {
+    // 低内存流式打包：逐个拉取文件并直接写入 zip，避免把所有文件 buffer 堆在内存里。
+    const failedItems: string[] = [];
+    for (const item of downloadItems) {
       try {
         const response = await axios.get(item.url, {
-          responseType: 'arraybuffer',
+          responseType: 'stream',
           headers: {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Referer': 'https://www.xiaohongshu.com/',
           },
           timeout: 30000
         });
-        return { ok: true as const, item, data: Buffer.from(response.data) };
+        archive.append(response.data, { name: item.filename });
+        await waitForReadableEnd(response.data);
+        console.log(`[打包] 流式添加: ${item.filename}`);
       } catch (err: any) {
         console.error(`[打包] 失败: ${item.filename} - ${err.message}`);
-        return { ok: false as const, item, error: err.message as string };
+        failedItems.push(`${item.filename}: ${err.message}`);
       }
-    });
+    }
 
-    // 按原顺序 append 到 zip（archiver 内部是流，顺序添加更高效）
-    for (const r of buffers) {
-      if (r.ok) {
-        archive.append(r.data, { name: r.item.filename });
-        console.log(`[打包] 添加: ${r.item.filename}`);
-      }
+    if (failedItems.length > 0) {
+      archive.append(
+        `以下文件下载失败，已跳过：\n${failedItems.join('\n')}\n`,
+        { name: '_download_errors.txt' }
+      );
     }
 
     await archive.finalize();

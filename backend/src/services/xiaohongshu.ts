@@ -1,6 +1,4 @@
 import axios from 'axios';
-import archiver from 'archiver';
-import { PassThrough } from 'stream';
 import path from 'path';
 import fs from 'fs';
 import { TTLCache } from '../utils/perf';
@@ -47,12 +45,39 @@ const MEDIACRAWLER_CONCURRENCY = Number(process.env.MEDIACRAWLER_CONCURRENCY || 
 // 结果缓存：相同关键词 / 博主 + 数量 在 TTL 内复用上一次结果，避免重启 Chromium + 重新爬取
 const RESULT_CACHE_TTL_MS = Number(process.env.RESULT_CACHE_TTL_MS || 5 * 60 * 1000); // 默认 5 分钟
 const resultCache = new TTLCache<NoteInfo[]>(RESULT_CACHE_TTL_MS, 50);
+const noteDetailCache = new TTLCache<NoteInfo>(RESULT_CACHE_TTL_MS, 100);
+
+// 运行时数据保留策略：只清理 MediaCrawler data 目录下的 JSON 输出，不碰浏览器登录数据。
+const RUNTIME_DATA_RETENTION_DAYS = Number(process.env.RUNTIME_DATA_RETENTION_DAYS || 3);
+const RUNTIME_DATA_MAX_JSON_FILES = Number(process.env.RUNTIME_DATA_MAX_JSON_FILES || 200);
 
 // 无水印视频的 CDN 特征（MediaCrawler 拿到 origin_video_key 时会拼成这个域名）
 // 无水印视频的 CDN 特征（小红书当前可观察到的视频域名规律：sns-video-*.xhscdn.com / .xhscdn.net）
 // 具体子域名会根据 CDN 调度变（bd/hw/qc/al/v1/v6 等），不保留精确列表
 // 这条匹配规则涵盖 MediaCrawler 和匿名直解两条路径拿到的无水印源
 const NO_WATERMARK_VIDEO_HOST_PATTERN = /^sns-video-[a-z0-9]+\.xhscdn\.(com|net)$/i;
+
+const CLEAN_XHS_URL_PATTERN = /https?:\/\/[^\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u2600-\u27bf]+/i;
+const TRAILING_SHARE_PUNCTUATION_PATTERN = /[。，；：、”》）]+$/g;
+const XHSLINK_PATTERN = /xhslink\.com\/([a-zA-Z0-9/]+)/;
+const FULL_URL_PATTERNS = [
+  /xiaohongshu\.com\/explore\/([a-zA-Z0-9]+)\?[^}]*xsec_token=/,
+  /xiaohongshu\.com\/discovery\/item\/([a-zA-Z0-9]+)\?[^}]*xsec_token=/,
+] as const;
+const NOTE_ID_PATTERNS = [
+  /xiaohongshu\.com\/explore\/([a-zA-Z0-9]+)/,
+  /xiaohongshu\.com\/discovery\/item\/([a-zA-Z0-9]+)/,
+  /^([a-zA-Z0-9]{24})$/,
+] as const;
+const USER_PROFILE_PATTERN = /user\/profile\/([a-zA-Z0-9]+)/;
+const UNICODE_SLASH_PATTERN = /\\u002F/g;
+const WATERMARK_PATH_PATTERN = /\/watermark\/.*/g;
+
+function parseMetric(value: any): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const n = parseInt(String(value || ''), 10);
+  return Number.isFinite(n) ? n : 0;
+}
 
 /**
  * 解析浏览器数据目录绝对路径（支持相对/绝对路径）
@@ -70,6 +95,38 @@ export function resolveBrowserDataPath(): string {
 export function resolveMediaCrawlerDataDir(): string {
   const rawPath = process.env.MEDIACRAWLER_DATA_DIR || '../MediaCrawler/data';
   return path.isAbsolute(rawPath) ? rawPath : path.resolve(process.cwd(), rawPath);
+}
+
+function isPathInsideDir(target: string, dir: string): boolean {
+  const resolvedDir = path.resolve(dir);
+  const resolvedTarget = path.resolve(target);
+  return resolvedTarget === resolvedDir || resolvedTarget.startsWith(resolvedDir + path.sep);
+}
+
+function listJsonFilesRecursive(dir: string, root = dir): Array<{ abs: string; rel: string; mtimeMs: number; size: number }> {
+  const entries = fs.readdirSync(dir, { withFileTypes: true });
+  const files: Array<{ abs: string; rel: string; mtimeMs: number; size: number }> = [];
+
+  for (const entry of entries) {
+    const abs = path.join(dir, entry.name);
+    if (!isPathInsideDir(abs, root)) continue;
+
+    if (entry.isDirectory()) {
+      files.push(...listJsonFilesRecursive(abs, root));
+      continue;
+    }
+
+    if (!entry.isFile() || !entry.name.toLowerCase().endsWith('.json')) continue;
+    const stat = fs.statSync(abs);
+    files.push({
+      abs,
+      rel: path.relative(root, abs),
+      mtimeMs: stat.mtimeMs,
+      size: stat.size,
+    });
+  }
+
+  return files;
 }
 
 /**
@@ -264,20 +321,12 @@ export class XiaohongshuService {
   private extractCleanXhsUrl(raw: string): string | null {
     // 匹配 "http(s)://...xiaohongshu.com/..." ，终止于空白或非 URL 合法字符
     // URL 合法字符集：字母数字 - . _ ~ : / ? # [ ] @ ! $ & ' ( ) * + , ; = %
-    const m = raw.match(/https?:\/\/[^\s\u4e00-\u9fff\u3000-\u303f\uff00-\uffef\u2600-\u27bf]+/i);
+    const m = raw.match(CLEAN_XHS_URL_PATTERN);
     if (!m) return null;
     let url = m[0];
     // 尾部有时会粘到标点，去一下
-    url = url.replace(/[。，；：、”》）]+$/g, '');
+    url = url.replace(TRAILING_SHARE_PUNCTUATION_PATTERN, '');
     return url;
-  }
-
-  /**
-   * 把 /discovery/item/ 路径统一改写为 /explore/（query 保留）
-   * 原因：小红书旧 discovery 页面 SSR 模板不稳定，新 explore 页面总有 __INITIAL_STATE__
-   */
-  private normalizeToExploreUrl(url: string): string {
-    return url.replace(/\/discovery\/item\//, '/explore/');
   }
 
   /**
@@ -294,8 +343,7 @@ export class XiaohongshuService {
     }
 
     // 1. xhslink 短链需要先展开
-    const xhslinkPattern = /xhslink\.com\/([a-zA-Z0-9\/]+)/;
-    const xhslinkMatch = url.match(xhslinkPattern);
+    const xhslinkMatch = url.match(XHSLINK_PATTERN);
     if (xhslinkMatch) {
       const realUrl = await this.resolveShortUrl(url.startsWith('http') ? url : `https://${url}`);
       if (realUrl) {
@@ -307,12 +355,7 @@ export class XiaohongshuService {
     //   匹配失败时由 anonymousParser 内部会切换路径重试一次（互为 fallback）。
 
     // 3. 含 xsec_token 的完整URL直接当 fullUrl、同时抽 noteId
-    const fullUrlPatterns = [
-      /xiaohongshu\.com\/explore\/([a-zA-Z0-9]+)\?[^}]*xsec_token=/,
-      /xiaohongshu\.com\/discovery\/item\/([a-zA-Z0-9]+)\?[^}]*xsec_token=/,
-    ];
-
-    for (const pattern of fullUrlPatterns) {
+    for (const pattern of FULL_URL_PATTERNS) {
       const m = url.match(pattern);
       if (m) {
         return { noteId: m[1], fullUrl: url };
@@ -320,13 +363,7 @@ export class XiaohongshuService {
     }
 
     // 4. 只有 noteId / 无 xsec_token 的链接
-    const patterns = [
-      /xiaohongshu\.com\/explore\/([a-zA-Z0-9]+)/,
-      /xiaohongshu\.com\/discovery\/item\/([a-zA-Z0-9]+)/,
-      /^([a-zA-Z0-9]{24})$/,
-    ];
-
-    for (const pattern of patterns) {
+    for (const pattern of NOTE_ID_PATTERNS) {
       const match = url.match(pattern);
       if (match) return { noteId: match[1], fullUrl: null };
     }
@@ -347,16 +384,27 @@ export class XiaohongshuService {
     // 日志脱敏：不输出完整 fullUrl（含 xsec_token临时凭证），仅输出 noteId 以便排查
     console.log(`[解析] 笔记ID: ${noteId}, 含完整URL: ${fullUrl ? '是' : '否'}`);
 
+    const detailCacheKey = fullUrl ? `detail:${fullUrl}` : `detail:${noteId}`;
+    const cachedDetail = noteDetailCache.get(detailCacheKey);
+    if (cachedDetail) {
+      console.log(`[解析][缓存命中] noteId=${noteId}, parseMode=${cachedDetail.parseMode}`);
+      return cachedDetail;
+    }
+
     // 【1】优先尝试匿名直解（需要完整 URL 含 xsec_token）
     // 这条路径不需要登录、不需要 MediaCrawler，秒级返回
     if (fullUrl) {
       try {
         const raw = await parseNoteAnonymous(fullUrl);
         const note = this.mapAnonymousToNoteInfo(raw, noteId);
+        noteDetailCache.set(detailCacheKey, note);
         console.log(`[匿名解析][成功] noteId=${noteId}, title="${note.title.slice(0, 30)}"`);
         return note;
       } catch (e: any) {
         const reason = e instanceof AnonymousParseError ? (e.reason || 'unknown') : 'exception';
+        if (reason === 'rate_limited') {
+          throw new Error('匿名解析请求过于频繁，请等待约 30 秒后再重试');
+        }
         console.warn(`[匿名解析][失败，回退 MediaCrawler] noteId=${noteId}, reason=${reason}, msg=${e.message}`);
         // 继续走下面的 MediaCrawler 逻辑
       }
@@ -437,7 +485,9 @@ export class XiaohongshuService {
         || noteDataList[noteDataList.length - 1];
       console.log(`[MediaCrawler] 解析成功: ${noteData.title}`);
 
-      return this.parseNoteData(noteData, noteId);
+      const note = this.parseNoteData(noteData, noteId);
+      noteDetailCache.set(detailCacheKey, note);
+      return note;
 
     } catch (error: any) {
       console.error(`[MediaCrawler] 错误: ${error.message}`);
@@ -455,10 +505,11 @@ export class XiaohongshuService {
     if (imageList) {
       if (typeof imageList === 'string') {
         // 字符串类型，按逗号分割
-        const urls = imageList.split(',').filter((url: string) => url.trim());
-        for (const url of urls) {
+        for (const item of imageList.split(',')) {
+          const url = item.trim();
+          if (!url) continue;
           // 将 HTTP 转换为 HTTPS
-          images.push(this.toHttps(this.cleanUrl(url.trim())));
+          images.push(this.toHttps(this.cleanUrl(url)));
         }
       } else if (Array.isArray(imageList)) {
         // 数组类型
@@ -523,9 +574,9 @@ export class XiaohongshuService {
       },
       images,
       video,
-      likes: parseInt(data.liked_count) || parseInt(data.likes) || 0,
-      collects: parseInt(data.collected_count) || parseInt(data.collects) || 0,
-      comments: parseInt(data.comment_count) || parseInt(data.comments) || 0,
+      likes: parseMetric(data.liked_count) || parseMetric(data.likes),
+      collects: parseMetric(data.collected_count) || parseMetric(data.collects),
+      comments: parseMetric(data.comment_count) || parseMetric(data.comments),
       noteUrl,
       creatorUrl,
       // 仅对 video 类型有意义；image 类型固定为 false
@@ -599,7 +650,7 @@ export class XiaohongshuService {
    */
   private cleanUrl(url: string): string {
     if (!url) return '';
-    return url.replace(/\\u002F/g, '/').replace(/\/watermark\/.*/g, '');
+    return url.replace(UNICODE_SLASH_PATTERN, '/').replace(WATERMARK_PATH_PATTERN, '');
   }
 
   /**
@@ -608,7 +659,7 @@ export class XiaohongshuService {
   private toHttps(url: string): string {
     if (!url) return '';
     if (url.startsWith('http://')) {
-      return url.replace('http://', 'https://');
+      return `https://${url.slice(7)}`;
     }
     return url;
   }
@@ -816,6 +867,80 @@ export class XiaohongshuService {
   }
 
   /**
+   * 定期清理 MediaCrawler data 目录下的 JSON 输出，防止小盘机器长期运行后被历史爬取结果占满。
+   *
+   * 策略：
+   * - 只处理 .json 文件，不碰浏览器登录数据、Cookies、构建产物或用户下载内容。
+   * - 删除超过 RUNTIME_DATA_RETENTION_DAYS 天的旧 JSON。
+   * - 同时保留最新 RUNTIME_DATA_MAX_JSON_FILES 个 JSON，超过数量的更旧文件会被删除。
+   */
+  cleanupRuntimeDataRetention(reason = 'scheduled'): void {
+    const dataDir = resolveMediaCrawlerDataDir();
+    if (!fs.existsSync(dataDir)) {
+      console.log(`[保洁] 数据目录不存在，跳过: ${dataDir}`);
+      return;
+    }
+
+    const maxAgeDays = Math.max(0, RUNTIME_DATA_RETENTION_DAYS);
+    const maxFiles = Math.max(0, RUNTIME_DATA_MAX_JSON_FILES);
+    if (maxAgeDays === 0 && maxFiles === 0) {
+      console.log('[保洁] 运行时数据保洁已关闭');
+      return;
+    }
+
+    let files: Array<{ abs: string; rel: string; mtimeMs: number; size: number }> = [];
+    try {
+      files = listJsonFilesRecursive(dataDir);
+    } catch (e: any) {
+      console.warn(`[保洁] 扫描数据目录失败（已忽略）: ${e.message}`);
+      return;
+    }
+
+    if (files.length === 0) {
+      console.log(`[保洁] 无 JSON 历史文件需要检查 (${reason})`);
+      return;
+    }
+
+    const cutoff = maxAgeDays > 0 ? Date.now() - maxAgeDays * 24 * 60 * 60 * 1000 : 0;
+    const byNewest = [...files].sort((a, b) => b.mtimeMs - a.mtimeMs);
+    const keepByCount = new Set<string>(
+      maxFiles > 0 ? byNewest.slice(0, maxFiles).map(f => f.abs) : byNewest.map(f => f.abs)
+    );
+
+    const targets = files.filter((file) => {
+      const expired = maxAgeDays > 0 && file.mtimeMs < cutoff;
+      const overflow = maxFiles > 0 && !keepByCount.has(file.abs);
+      return expired || overflow;
+    });
+
+    if (targets.length === 0) {
+      console.log(`[保洁] JSON 历史文件健康: ${files.length} 个，无需清理 (${reason})`);
+      return;
+    }
+
+    let removed = 0;
+    let removedBytes = 0;
+    let failed = 0;
+    for (const file of targets) {
+      if (!isPathInsideDir(file.abs, dataDir)) {
+        console.warn(`[保洁] 跳过越界路径: ${file.rel}`);
+        continue;
+      }
+      try {
+        fs.unlinkSync(file.abs);
+        removed++;
+        removedBytes += file.size;
+      } catch (e: any) {
+        failed++;
+        console.warn(`[保洁] 删除失败（已忽略）: ${file.rel} - ${e.message}`);
+      }
+    }
+
+    const mb = (removedBytes / 1024 / 1024).toFixed(2);
+    console.log(`[保洁] 已清理 ${removed}/${targets.length} 个 JSON，释放约 ${mb} MB${failed > 0 ? `，失败 ${failed} 个` : ''} (${reason})`);
+  }
+
+  /**
    * 获取搜索结果数据
    * @param keywords    本次搜索的关键词，用于按 source_keyword 精准过滤，防止历史追加数据污染
    * @param maxCount    期望返回的最大条数（仅作底层共同约定，本函数不再主动截断）
@@ -846,27 +971,22 @@ export class XiaohongshuService {
       return [];
     }
 
-    // 按本次 keywords 的 source_keyword 过滤；MediaCrawler 追加模式会残留历史数据
-    // 【严格模式】过滤为空 → 直接返回 []，不再降级返回 noteDataList 全量。
-    // 历史教训：当登录态失效导致本次爬到 0 条时，旧的「降级返回 noteDataList」
-    // 会把别的关键词的历史结果伪装成本次结果返回给用户。宁可空，也不能污染。
-    let filtered: any[] = noteDataList;
-    if (keywords) {
-      const kw = keywords.trim();
-      filtered = noteDataList.filter((d: any) => {
-        const sk = String(d.source_keyword || '').trim();
-        return sk === kw || sk.includes(kw);
-      });
-    }
-    const beforeTime = filtered.length;
-
-    // 按本次任务开始时间戳过滤：只留本次新爬的，避免杂入当天历史数据
-    // 【严格模式】过滤为空 → 直接返回 []，不再 slice 兜底。
-    if (typeof sinceMs === 'number' && sinceMs > 0) {
-      filtered = filtered.filter((d: any) => {
+    // 单次扫描同时完成关键词和时间过滤，避免大结果 JSON 被多次 filter 分配。
+    const kw = keywords?.trim() || '';
+    const hasSince = typeof sinceMs === 'number' && sinceMs > 0;
+    const filtered: any[] = [];
+    let beforeTime = 0;
+    for (const d of noteDataList) {
+      if (kw) {
+        const sk = String(d?.source_keyword || '').trim();
+        if (sk !== kw && !sk.includes(kw)) continue;
+      }
+      beforeTime++;
+      if (hasSince) {
         const ts = Number(d?.last_modify_ts);
-        return Number.isFinite(ts) && ts >= sinceMs;
-      });
+        if (!Number.isFinite(ts) || ts < sinceMs) continue;
+      }
+      filtered.push(d);
     }
     console.log(`[搜索] 过滤结果: ${filtered.length}/${beforeTime}/${noteDataList.length} 条 (keywords=${keywords || '未指定'}, since=${sinceMs ? new Date(sinceMs).toISOString() : '无'})`);
 
@@ -884,7 +1004,7 @@ export class XiaohongshuService {
     console.log(`[博主] URL: ${url}`);
 
     // 从 URL 中精确提取用户ID；若未命中，只有输入本身看起来像 ID 时才采用。
-    const userIdMatch = url.match(/user\/profile\/([a-zA-Z0-9]+)/);
+    const userIdMatch = url.match(USER_PROFILE_PATTERN);
     const userId = userIdMatch
       ? userIdMatch[1]
       : (/^[a-zA-Z0-9]+$/.test(url) ? url : '');
@@ -979,18 +1099,24 @@ export class XiaohongshuService {
       return [];
     }
 
-    // 有效 userId 时才过滤；否则直接返回全部数据，避免过滤器失效时回空集
-    let filteredData: any[] = userId
-      ? noteDataList.filter((data: any) => data.user_id === userId)
-      : noteDataList;
+    // 单次扫描完成 userId 过滤和时间候选收集；保留原有“时间过滤为空则回退 userId 结果”的策略。
+    let filteredData: any[] = [];
+    const withTs: any[] = [];
+    const hasSince = typeof sinceMs === 'number' && sinceMs > 0;
+    for (const data of noteDataList) {
+      if (userId && data.user_id !== userId) continue;
+      filteredData.push(data);
+      if (hasSince) {
+        const ts = Number(data?.last_modify_ts);
+        if (Number.isFinite(ts) && ts >= sinceMs) {
+          withTs.push(data);
+        }
+      }
+    }
     const beforeTime = filteredData.length;
 
     // 按本次任务开始时间戳过滤
-    if (typeof sinceMs === 'number' && sinceMs > 0) {
-      const withTs = filteredData.filter((d: any) => {
-        const ts = Number(d?.last_modify_ts);
-        return Number.isFinite(ts) && ts >= sinceMs;
-      });
+    if (hasSince) {
       filteredData = withTs.length > 0 ? withTs : filteredData;
     }
     console.log(`[博主] 过滤结果: ${filteredData.length}/${beforeTime}/${noteDataList.length} 条 (userId=${userId || '未解析'}, since=${sinceMs ? new Date(sinceMs).toISOString() : '无'})`);
@@ -1053,26 +1179,28 @@ export class XiaohongshuService {
       return { count: 0, status };
     }
 
-    // 5. 按 key 过滤、再按 sinceMs 过滤，返回「本次新爬」的数目（与最终结果口径对齐）
+    // 5. 按 key 和 sinceMs 单次扫描计数，返回「本次新爬」的数目（与最终结果口径对齐）
     const trimmed = (key || '').trim();
-    let matched: any[] = noteDataList;
-    if (trimmed) {
-      if (mode === 'search') {
-        matched = noteDataList.filter((d: any) => {
+    const hasSince = typeof sinceMs === 'number' && sinceMs > 0;
+    let count = 0;
+    for (const d of noteDataList) {
+      if (trimmed) {
+        if (mode === 'search') {
           const sk = String(d?.source_keyword || '').trim();
-          return sk === trimmed || sk.includes(trimmed);
-        });
-      } else {
-        matched = noteDataList.filter((d: any) => String(d?.user_id || '') === trimmed);
+          if (sk !== trimmed && !sk.includes(trimmed)) continue;
+        } else if (String(d?.user_id || '') !== trimmed) {
+          continue;
+        }
       }
-    }
-    if (typeof sinceMs === 'number' && sinceMs > 0) {
-      matched = matched.filter((d: any) => {
+      if (hasSince) {
         const ts = Number(d?.last_modify_ts);
-        return Number.isFinite(ts) && ts >= sinceMs;
-      });
+        if (!Number.isFinite(ts) || ts < sinceMs) {
+          continue;
+        }
+      }
+      count++;
     }
-    return { count: matched.length, status };
+    return { count, status };
   }
 
   /**

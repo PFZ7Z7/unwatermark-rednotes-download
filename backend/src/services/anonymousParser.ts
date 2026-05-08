@@ -42,12 +42,21 @@ export interface AnonymousNoteRaw {
 const RATE_WINDOW_MS = 30_000;
 /** 同一 noteId 在窗口内最多尝试次数 */
 const RATE_MAX_PER_NOTE = 3;
+const RATE_MAX_TRACKED_NOTES = 1000;
 
 const hitMap: Map<string, number[]> = new Map();
 
 function isRateLimited(noteId: string): boolean {
   const now = Date.now();
-  const hits = (hitMap.get(noteId) || []).filter((t) => now - t < RATE_WINDOW_MS);
+  if (hitMap.size > RATE_MAX_TRACKED_NOTES) {
+    pruneRateMap(now);
+  }
+
+  const oldHits = hitMap.get(noteId) || [];
+  const hits: number[] = [];
+  for (const t of oldHits) {
+    if (now - t < RATE_WINDOW_MS) hits.push(t);
+  }
   if (hits.length >= RATE_MAX_PER_NOTE) {
     hitMap.set(noteId, hits);
     return true;
@@ -55,6 +64,18 @@ function isRateLimited(noteId: string): boolean {
   hits.push(now);
   hitMap.set(noteId, hits);
   return false;
+}
+
+function pruneRateMap(now = Date.now()): void {
+  for (const [id, timestamps] of hitMap) {
+    const active = timestamps.filter((t) => now - t < RATE_WINDOW_MS);
+    if (active.length > 0) {
+      hitMap.set(id, active);
+    } else {
+      hitMap.delete(id);
+    }
+    if (hitMap.size <= RATE_MAX_TRACKED_NOTES) break;
+  }
 }
 
 /* ============================== 核心解析 ============================== */
@@ -65,6 +86,18 @@ const USER_AGENT =
 
 const HTTP_TIMEOUT_MS = 10_000;
 
+const httpClient = axios.create({
+  headers: {
+    'User-Agent': USER_AGENT,
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+    'Accept-Language': 'zh-CN,zh;q=0.9',
+    'Referer': 'https://www.xiaohongshu.com/',
+  },
+  timeout: HTTP_TIMEOUT_MS,
+  maxRedirects: 5,
+  responseType: 'text',
+});
+
 /** 风控/验证码页面的常见关键字 */
 const ANTI_BOT_SIGNATURES = [
   '访问验证',
@@ -72,7 +105,22 @@ const ANTI_BOT_SIGNATURES = [
   'captcha',
   '系统繁忙',
   '人机验证',
-];
+] as const;
+const CASE_INSENSITIVE_ANTI_BOT_SIGNATURES = ['captcha'] as const;
+
+const INITIAL_STATE_PATTERN = /window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*<\/script>/;
+const NEXT_DATA_PATTERN = /<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/;
+const JSON_UNDEFINED_VALUE_PATTERN = /:\s*undefined\b/g;
+const JSON_UNDEFINED_ARRAY_ITEM_PATTERN = /,\s*undefined\s*(?=[,\]])/g;
+const NOTE_PATH_PATTERN = /\/(?:explore|discovery\/item)\/([a-zA-Z0-9]+)/;
+const XSEC_TOKEN_PATTERN = /[?&]xsec_token=([^&#]+)/;
+const NON_DIGIT_PATTERN = /[^\d]/g;
+
+function parseMetric(value: any): number {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const n = parseInt(String(value || '').replace(NON_DIGIT_PATTERN, ''), 10);
+  return Number.isFinite(n) ? n : 0;
+}
 
 /**
  * 从 HTML 中提取嵌入的 JSON 数据块
@@ -82,13 +130,13 @@ const ANTI_BOT_SIGNATURES = [
  */
 function extractInitialState(html: string): any {
   // 形态 1：__INITIAL_STATE__
-  const m1 = html.match(/window\.__INITIAL_STATE__\s*=\s*({[\s\S]*?})\s*<\/script>/);
+  const m1 = html.match(INITIAL_STATE_PATTERN);
   if (m1) {
     return safeParseJson(m1[1]);
   }
 
   // 形态 2：__NEXT_DATA__（放在 <script id="__NEXT_DATA__" type="application/json">）
-  const m2 = html.match(/<script[^>]*id=["']__NEXT_DATA__["'][^>]*>([\s\S]*?)<\/script>/);
+  const m2 = html.match(NEXT_DATA_PATTERN);
   if (m2) {
     return safeParseJson(m2[1]);
   }
@@ -101,10 +149,13 @@ function extractInitialState(html: string): any {
  */
 function safeParseJson(raw: string): any {
   try {
-    const cleaned = raw
-      .replace(/:\s*undefined\b/g, ':null')
-      // 处理像 ,undefined, 这种极少见情况（数组里）
-      .replace(/,\s*undefined\s*(?=[,\]])/g, ',null');
+    // 大多数页面是标准 JSON；只有出现 undefined 时才分配新字符串做净化。
+    const cleaned = raw.includes('undefined')
+      ? raw
+          .replace(JSON_UNDEFINED_VALUE_PATTERN, ':null')
+          // 处理像 ,undefined, 这种极少见情况（数组里）
+          .replace(JSON_UNDEFINED_ARRAY_ITEM_PATTERN, ',null')
+      : raw;
     return JSON.parse(cleaned);
   } catch {
     return null;
@@ -128,7 +179,8 @@ function findNoteNode(state: any, noteId: string): any {
 function toHttps(url: string): string {
   if (!url) return '';
   if (url.startsWith('//')) return 'https:' + url;
-  return url.replace(/^http:\/\//, 'https://');
+  if (url.startsWith('http://')) return `https://${url.slice(7)}`;
+  return url;
 }
 
 /** 从 note 节点映射成项目统一结构 */
@@ -170,11 +222,6 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
   const user = note.user || {};
   const userId = user.userId || user.user_id || note.userId || '';
 
-  // 互动数据（可能是字符串 "1.2w"，做容错）
-  const numOrZero = (v: any): number => {
-    const n = typeof v === 'number' ? v : parseInt(String(v || '').replace(/[^\d]/g, ''), 10);
-    return Number.isFinite(n) ? n : 0;
-  };
   const interact = note.interactInfo || note.interact_info || {};
 
   const type: 'video' | 'image' =
@@ -192,9 +239,9 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
     },
     image_list: images,
     video,
-    liked_count: numOrZero(interact.likedCount ?? interact.liked_count ?? note.likedCount),
-    collected_count: numOrZero(interact.collectedCount ?? interact.collected_count ?? note.collectedCount),
-    comment_count: numOrZero(interact.commentCount ?? interact.comment_count ?? note.commentCount),
+    liked_count: parseMetric(interact.likedCount ?? interact.liked_count ?? note.likedCount),
+    collected_count: parseMetric(interact.collectedCount ?? interact.collected_count ?? note.collectedCount),
+    comment_count: parseMetric(interact.commentCount ?? interact.comment_count ?? note.commentCount),
     xsec_token: xsecToken,
   };
 }
@@ -204,9 +251,9 @@ function mapNoteNode(note: any, noteId: string, xsecToken: string): AnonymousNot
  * @throws AnonymousParseError 如果无法提取
  */
 function extractIds(url: string): { noteId: string; xsecToken: string } {
-  const m = url.match(/\/(?:explore|discovery\/item)\/([a-zA-Z0-9]+)/);
+  const m = url.match(NOTE_PATH_PATTERN);
   if (!m) throw new AnonymousParseError('无法从 URL 提取 noteId', 'no_note_id');
-  const tokenMatch = url.match(/[?&]xsec_token=([^&#]+)/);
+  const tokenMatch = url.match(XSEC_TOKEN_PATTERN);
   if (!tokenMatch) throw new AnonymousParseError('URL 缺少 xsec_token', 'no_xsec_token');
   return { noteId: m[1], xsecToken: decodeURIComponent(tokenMatch[1]) };
 }
@@ -238,16 +285,7 @@ async function fetchAndExtract(
   // 抓 HTML
   let html: string;
   try {
-    const resp = await axios.get<string>(targetUrl, {
-      headers: {
-        'User-Agent': USER_AGENT,
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-        'Accept-Language': 'zh-CN,zh;q=0.9',
-        'Referer': 'https://www.xiaohongshu.com/',
-      },
-      timeout: HTTP_TIMEOUT_MS,
-      maxRedirects: 5,
-      responseType: 'text',
+    const resp = await httpClient.get<string>(targetUrl, {
       validateStatus: (s) => s >= 200 && s < 400,
     });
     html = String(resp.data || '');
@@ -256,9 +294,15 @@ async function fetchAndExtract(
   }
 
   // 风控识别
-  const lowerHtml = html.toLowerCase();
   for (const sig of ANTI_BOT_SIGNATURES) {
-    if (html.includes(sig) || lowerHtml.includes(sig.toLowerCase())) {
+    if (html.includes(sig)) {
+      throw new AnonymousParseError(`命中风控关键字: ${sig}`, 'anti_bot');
+    }
+  }
+  let lowerHtml: string | null = null;
+  for (const sig of CASE_INSENSITIVE_ANTI_BOT_SIGNATURES) {
+    lowerHtml ??= html.toLowerCase();
+    if (lowerHtml.includes(sig)) {
       throw new AnonymousParseError(`命中风控关键字: ${sig}`, 'anti_bot');
     }
   }

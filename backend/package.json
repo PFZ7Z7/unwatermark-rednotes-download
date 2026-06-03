@@ -18,7 +18,7 @@
   "description": "小红书无水印下载工具后端服务",
   "dependencies": {
     "archiver": "^7.0.1",
-    "axios": "^1.15.2",
+    "axios": "^1.16.1",
     "better-sqlite3": "^11.10.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",

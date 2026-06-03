@@ -765,7 +765,7 @@ const FRONTEND_DIST = process.env.FRONTEND_DIST
 if (fs.existsSync(FRONTEND_DIST)) {
   app.use(express.static(FRONTEND_DIST, { maxAge: '1h', index: false }));
   app.use((req: Request, res: Response, next) => {
-    if (req.method !== 'GET') return next();
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
     if (req.path.startsWith('/api/')) return next();
     res.sendFile(path.join(FRONTEND_DIST, 'index.html'), (err: any) => {
       if (err) next(err);

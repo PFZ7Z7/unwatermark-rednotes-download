@@ -1,16 +1,27 @@
-import express, { Request, Response } from 'express';
+import express, { NextFunction, Request, Response } from 'express';
 import cors from 'cors';
 import dotenv from 'dotenv';
 import archiver from 'archiver';
 import path from 'path';
 import fs from 'fs';
-import { XiaohongshuService, LoginRequiredError, detectLoginState } from './services/xiaohongshu';
+import crypto from 'crypto';
+import { XiaohongshuService, LoginRequiredError } from './services/xiaohongshu';
+import {
+  AdminCookieValidationError,
+  clearAdminCookie,
+  getAdminCookieStatus,
+  saveAdminCookie,
+} from './services/adminCookieStore';
 import axios from 'axios';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
+
+const ENHANCED_MODE_READY_MESSAGE = '增强模式已可用';
+const ENHANCED_MODE_MAINTENANCE_MESSAGE = '增强模式维护中，普通链接下载不受影响';
 
 // 将任意错误归一化为 JSON，登录错误带上 needLogin=true
 function sendError(res: Response, err: any, fallbackStatus = 500) {
@@ -21,8 +32,8 @@ function sendError(res: Response, err: any, fallbackStatus = 500) {
     return res.status(401).json({
       success: false,
       needLogin: true,
-      message: err?.message || '登录状态失效，请先扫码登录',
-      hint: '点击「扫码登录」按钮进行登录'
+      message: err?.message || ENHANCED_MODE_MAINTENANCE_MESSAGE,
+      hint: '增强模式由管理员维护，请稍后再试；普通链接下载不受影响'
     });
   }
   return res.status(fallbackStatus).json({
@@ -39,6 +50,7 @@ const PROXY_ALLOWED_HOSTS = (process.env.PROXY_ALLOWED_HOSTS || 'xhscdn.com,xhsc
 
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '1mb';
 const MAX_ZIP_ITEMS = Math.max(1, Number(process.env.MAX_ZIP_ITEMS || 500));
+const MEDIA_ENRICH_CONCURRENCY = Math.max(1, Number(process.env.MEDIA_ENRICH_CONCURRENCY || 5));
 const RUNTIME_CLEANUP_INTERVAL_MS = Math.max(
   60_000,
   Number(process.env.RUNTIME_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000)
@@ -144,6 +156,84 @@ app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const xhsService = new XiaohongshuService();
 
+type MediaCrawlerSnapshot = {
+  driverRunning: boolean;
+  message: string;
+};
+
+async function getMediaCrawlerSnapshot(): Promise<MediaCrawlerSnapshot> {
+  try {
+    await axios.get(`${MEDIACRAWLER_API}/api/crawler/status`, { timeout: 5000 });
+    return {
+      driverRunning: true,
+      message: '驱动器运行中',
+    };
+  } catch {
+    return {
+      driverRunning: false,
+      message: '驱动器未运行',
+    };
+  }
+}
+
+function buildEnhancedModeStatus() {
+  const cookieStatus = getAdminCookieStatus();
+  return getMediaCrawlerSnapshot().then((crawler) => {
+    const enhancedModeAvailable = crawler.driverRunning && cookieStatus.present && cookieStatus.validFormat;
+    return {
+      crawler,
+      cookieStatus,
+      data: {
+        mode: 'ADMIN_COOKIE',
+        canSelfLogin: false,
+        driverRunning: crawler.driverRunning,
+        loginValid: enhancedModeAvailable,
+        enhancedModeAvailable,
+        loginMessage: enhancedModeAvailable ? ENHANCED_MODE_READY_MESSAGE : ENHANCED_MODE_MAINTENANCE_MESSAGE,
+        hint: enhancedModeAvailable ? null : '需要管理员在 /admin 更新 Cookie 或启动驱动器',
+        cookieConfigured: cookieStatus.present,
+        cookieValidFormat: cookieStatus.validFormat,
+        cookieUpdatedAt: cookieStatus.updatedAt,
+        cookieValidatedAt: cookieStatus.validatedAt,
+      },
+    };
+  });
+}
+
+function getAdminTokenFromRequest(req: Request): string {
+  const authHeader = req.get('Authorization') || '';
+  const bearerMatch = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (bearerMatch?.[1]) return bearerMatch[1].trim();
+  return (req.get('X-Admin-Token') || '').trim();
+}
+
+function timingSafeTokenEqual(actual: string, expected: string): boolean {
+  const actualBuffer = Buffer.from(actual);
+  const expectedBuffer = Buffer.from(expected);
+  if (actualBuffer.length !== expectedBuffer.length) return false;
+  return crypto.timingSafeEqual(actualBuffer, expectedBuffer);
+}
+
+function requireAdmin(req: Request, res: Response, next: NextFunction) {
+  const configuredToken = process.env.ADMIN_TOKEN;
+  if (!configuredToken) {
+    return res.status(503).json({
+      success: false,
+      message: 'ADMIN_TOKEN 未配置，管理接口不可用',
+    });
+  }
+
+  const token = getAdminTokenFromRequest(req);
+  if (!token || !timingSafeTokenEqual(token, configuredToken)) {
+    return res.status(401).json({
+      success: false,
+      message: '管理员认证失败',
+    });
+  }
+
+  next();
+}
+
 function runRuntimeCleanup(reason: string) {
   try {
     xhsService.cleanupRuntimeDataRetention(reason);
@@ -166,116 +256,90 @@ app.get('/api/health', (req: Request, res: Response) => {
 
 // 检查登录状态
 app.get('/api/login-status', async (req: Request, res: Response) => {
-  try {
-    const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
-
-    // 检查 MediaCrawler 是否运行
-    await axios.get(`${MEDIACRAWLER_API}/api/crawler/status`, { timeout: 5000 });
-
-    // 统一登录态检测（兼容新旧版 Chromium 的 Cookies 路径）
-    const state = detectLoginState();
-
-    res.json({
-      success: true,
-      data: {
-        mediaCrawlerRunning: true,
-        loginValid: state.valid,
-        loginMessage: state.message,
-        hint: state.valid ? null : '点击「扫码登录」按钮进行登录'
-      }
-    });
-  } catch (error: any) {
-    res.json({
-      success: false,
-      data: {
-        mediaCrawlerRunning: false,
-        loginValid: false,
-        loginMessage: 'MediaCrawler 服务未运行',
-        hint: '请启动 MediaCrawler 服务'
-      }
-    });
-  }
+  const status = await buildEnhancedModeStatus();
+  res.json({ success: true, data: status.data });
 });
 
-// 触发登录（启动带界面的爬虫）
+// 公开扫码登录已停用：生产环境增强模式改为管理员维护 Cookie
 app.post('/api/login', async (req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    message: '公开扫码登录已停用，增强模式由管理员维护',
+    hint: '管理员请访问 /admin 提交 Xiaohongshu Cookie',
+  });
+});
+
+// 公开退出登录已停用：不能让普通用户清理管理员维护的 Cookie
+app.post('/api/logout', async (req: Request, res: Response) => {
+  res.status(410).json({
+    success: false,
+    message: '公开退出登录已停用，管理员可在 /admin 清除 Cookie',
+  });
+});
+
+app.get('/api/admin/auth/status', requireAdmin, async (req: Request, res: Response) => {
+  const status = await buildEnhancedModeStatus();
+  res.json({
+    success: true,
+    data: {
+      ...status.data,
+      cookieStatus: status.cookieStatus,
+    },
+  });
+});
+
+app.post('/api/admin/auth/cookie', requireAdmin, async (req: Request, res: Response) => {
   try {
-    const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
-
-    // 启动一个带界面的搜索任务来触发登录
-    const response = await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, {
-      platform: 'xhs',
-      login_type: 'qrcode',  // 使用二维码登录
-      crawler_type: 'search',
-      keywords: 'test',
-      enable_comments: false,
-      save_option: 'json',
-      headless: false  // 显示浏览器界面
-    }, { timeout: 30000 });
-
+    const cookieStatus = saveAdminCookie(req.body?.cookie);
+    const crawler = await getMediaCrawlerSnapshot();
+    const enhancedModeAvailable = crawler.driverRunning && cookieStatus.present && cookieStatus.validFormat;
     res.json({
       success: true,
-      message: '请在弹出的浏览器窗口中扫码登录',
-      hint: '登录成功后，关闭浏览器窗口即可'
+      message: '管理员 Cookie 已保存',
+      data: {
+        mode: 'ADMIN_COOKIE',
+        canSelfLogin: false,
+        driverRunning: crawler.driverRunning,
+        enhancedModeAvailable,
+        loginValid: enhancedModeAvailable,
+        loginMessage: enhancedModeAvailable ? ENHANCED_MODE_READY_MESSAGE : ENHANCED_MODE_MAINTENANCE_MESSAGE,
+        cookieStatus,
+      },
     });
   } catch (error: any) {
-    console.error('[API] 登录启动错误:', error.message);
-    res.status(500).json({
-      success: false,
-      message: '启动登录失败: ' + error.message,
-      hint: '请手动在终端运行: cd MediaCrawler && python main.py --platform xhs --lt qrcode --type search --keywords test --headless false'
-    });
+    if (error instanceof AdminCookieValidationError) {
+      return res.status(400).json({ success: false, message: error.message });
+    }
+    res.status(500).json({ success: false, message: '保存 Cookie 失败' });
   }
 });
 
-// 退出登录：清理 MediaCrawler 浏览器数据里的 Cookies 文件，下次再用需要重新扫码
-//   - 先停掉可能还在跑的 crawler 子进程，避免 Windows 上 Cookies 文件被占用
-//   - 删除 Cookies 及其 SQLite 伴随文件（-journal/-wal/-shm），保留 browser_data 其他配置
-app.post('/api/logout', async (req: Request, res: Response) => {
-  console.log('[API] 退出登录请求');
-  // 1. 停止可能占用 Cookies 文件的 crawler 进程
+app.post('/api/admin/auth/clear', requireAdmin, async (req: Request, res: Response) => {
+  const cookieStatus = clearAdminCookie();
+  res.json({
+    success: true,
+    message: '管理员 Cookie 已清除',
+    data: { cookieStatus },
+  });
+});
+
+app.post('/api/admin/crawler/stop', requireAdmin, async (req: Request, res: Response) => {
   try {
     await xhsService.stopCrawler();
-  } catch (err: any) {
-    console.warn(`[API] 退出登录时 stopCrawler 异常（已忽略）: ${err.message}`);
-  }
-
-  // 2. 定位并删除 Cookies 文件（及 SQLite 伴随文件）
-  const state = detectLoginState();
-  if (!state.cookiesFile) {
-    return res.json({ success: true, message: '当前无登录状态，无需退出' });
-  }
-  const base = state.cookiesFile;
-  const targets = [base, `${base}-journal`, `${base}-wal`, `${base}-shm`];
-  const removed: string[] = [];
-  const failed: { path: string; err: string }[] = [];
-  for (const p of targets) {
-    if (!fs.existsSync(p)) continue;
-    try {
-      fs.unlinkSync(p);
-      removed.push(path.basename(p));
-    } catch (err: any) {
-      // Windows 文件占用时降级为清空内容，让 detectLoginState 判定为无效
-      try {
-        fs.truncateSync(p, 0);
-        removed.push(path.basename(p) + '(truncated)');
-      } catch (err2: any) {
-        failed.push({ path: p, err: err2.message || err.message });
-      }
-    }
-  }
-
-  if (failed.length > 0) {
-    console.error('[API] 退出登录部分失败:', failed);
-    return res.status(500).json({
-      success: false,
-      message: '退出失败，文件可能被占用：' + failed.map(f => path.basename(f.path)).join(', '),
-      hint: '请先关闭残留的浏览器窗口后重试'
+    const crawler = await getMediaCrawlerSnapshot();
+    res.json({
+      success: true,
+      message: '已请求停止驱动器当前任务',
+      data: {
+        driver: {
+          running: crawler.driverRunning,
+          message: crawler.message,
+        },
+      },
     });
+  } catch {
+    res.status(500).json({ success: false, message: '停止驱动器失败' });
   }
-
-  console.log(`[API] 退出登录完成，已清理: ${removed.join(', ')}`);
-  res.json({ success: true, message: '已退出登录', removed });
 });
 
 // 取消当前任务：不仅序号 +1，还要真正通知 MediaCrawler 停止子进程
@@ -344,20 +408,40 @@ app.get('/api/progress', async (req: Request, res: Response) => {
     const key = String(req.query.key || '');
     const sinceRaw = Number(req.query.since);
     const sinceMs = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : undefined;
+    const targetRaw = Number(req.query.target);
+    const targetCount = Number.isFinite(targetRaw) && targetRaw > 0 ? targetRaw : undefined;
     const progress = await xhsService.getLiveProgress(mode, key, sinceMs);
     res.json({
       success: true,
       data: {
         mode,
         key,
+        targetCount,
         count: progress.count,
+        parsedCount: progress.parsedCount,
+        discoveredCount: progress.discoveredCount,
+        detailTaskCount: progress.detailTaskCount,
         status: progress.status,
         taskId: currentTaskId,
       },
     });
   } catch (error: any) {
     // progress 接口不应该因为后端细节出错而让轮询断掉
-    res.json({ success: true, data: { count: 0, status: 'unknown', taskId: currentTaskId } });
+    res.json({ success: true, data: { count: 0, parsedCount: 0, discoveredCount: 0, detailTaskCount: 0, status: 'unknown', taskId: currentTaskId } });
+  }
+});
+
+app.post('/api/enrich-note', async (req: Request, res: Response) => {
+  try {
+    const { note } = req.body || {};
+    if (!note || typeof note !== 'object') {
+      return res.status(400).json({ success: false, message: '请提供需要补全的笔记' });
+    }
+
+    const enriched = await xhsService.enrichNoteMedia(note);
+    res.json({ success: true, data: enriched });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message || '补全媒体信息失败' });
   }
 });
 
@@ -545,11 +629,12 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
     }
 
     console.log(`[API] 打包下载: ${notes.length} 个笔记`);
+    const enrichedNotes = await xhsService.enrichNotesMedia(notes, MEDIA_ENRICH_CONCURRENCY);
 
     // 收集所有下载URL（同时过滤白名单外的链接）
     const downloadItems: { url: string; filename: string; fallbackUrls?: string[] }[] = [];
     const usedFilenames = new Set<string>();
-    for (const note of notes) {
+    for (const note of enrichedNotes) {
       const noteId = sanitizeFileSegment(note?.noteId, 'note');
       if (note.type === 'video' && note.video?.url && isAllowedProxyUrl(note.video.url)) {
         const filename = createUniqueFilename(`${noteId}_video.mp4`, usedFilenames);

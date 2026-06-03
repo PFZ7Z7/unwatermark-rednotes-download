@@ -51,8 +51,11 @@ ENV NODE_ENV=production
 ENV PORT=3001
 ENV FRONTEND_DIST=/app/frontend-dist
 
-# 非 root 运行
-RUN groupadd -r xhs && useradd -r -g xhs -d /app -s /usr/sbin/nologin xhs
+# 非 root 运行；/app/runtime 用于持久化管理员 Cookie
+RUN groupadd -r xhs \
+    && useradd -r -g xhs -d /app -s /usr/sbin/nologin xhs \
+    && mkdir -p /app/runtime \
+    && chown -R xhs:xhs /app
 
 # 后端：package.json 用于 node 解析模块 + 精简后的 node_modules + 编译产物
 COPY --from=backend-build --chown=xhs:xhs /app/backend/package.json ./package.json

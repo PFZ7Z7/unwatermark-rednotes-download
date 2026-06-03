@@ -12,6 +12,8 @@ services:
     environment:
       NODE_ENV: production
       PORT: 3001
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?请在 .env 里设置 ADMIN_TOKEN}
+      XHS_COOKIE_STORE_PATH: /app/runtime/xhs-cookie.json
       # CORS：同源访问用不到；如需跨域前端，用逗号分隔
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001}
       # MediaCrawler 跑在宿主机 → 通过 host.docker.internal 访问
@@ -26,6 +28,8 @@ services:
       RUNTIME_DATA_MAX_JSON_FILES: ${RUNTIME_DATA_MAX_JSON_FILES:-200}
       RUNTIME_CLEANUP_INTERVAL_MS: ${RUNTIME_CLEANUP_INTERVAL_MS:-21600000}
     volumes:
+      # 管理员 Cookie 运行时存储，不进入镜像和 git，容器重建后保留
+      - xhs_runtime:/app/runtime
       # 宿主机上 MediaCrawler 的 browser_data（读写：登录态会被 Chromium 写回）
       - ${MC_HOST_BROWSER_DATA:?请在 .env 里设置 MC_HOST_BROWSER_DATA 指向宿主机 MediaCrawler/browser_data}:/mnt/mediacrawler/browser_data
       # 宿主机上 MediaCrawler 的 data（读写：清理历史数据需要删 JSON）
@@ -39,3 +43,6 @@ services:
         max-size: "10m"
         max-file: "3"
     # 健康检查由 Dockerfile 的 HEALTHCHECK 指令负责，这里无需重复
+
+volumes:
+  xhs_runtime:

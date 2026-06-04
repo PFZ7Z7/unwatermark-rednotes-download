@@ -1,6 +1,7 @@
 import { describe, test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
+  buildCookieScopedCacheKey,
   buildMediaCrawlerStartPayload,
   mergeEnrichedNoteMedia,
   parseCrawlerLogProgress,
@@ -53,6 +54,17 @@ describe('MediaCrawler progress parsing', () => {
     ]);
 
     assert.equal(progress.discoveredCount, 2);
+  });
+});
+
+describe('Cookie-scoped cache key', () => {
+  test('separates identical searches from different cookies without exposing the cookie', () => {
+    const keyA = buildCookieScopedCacheKey('search', 'web_session=a', 'test', 20);
+    const keyB = buildCookieScopedCacheKey('search', 'web_session=b', 'test', 20);
+
+    assert.notEqual(keyA, keyB);
+    assert.equal(keyA.includes('web_session'), false);
+    assert.match(keyA, /^search:[a-f0-9]{16}:test:20$/);
   });
 });
 

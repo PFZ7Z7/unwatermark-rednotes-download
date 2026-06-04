@@ -3,14 +3,23 @@ import path from 'path';
 
 const DEFAULT_COOKIE_STORE_PATH = path.join('runtime', 'xhs-cookie.json');
 const MAX_COOKIE_LENGTH = 50_000;
+const COOKIE_VALIDATION_MODE = 'selfinfo-v2';
+
+export type AdminCookieAccount = {
+  nickname?: string;
+  avatar?: string;
+  userId?: string;
+};
 
 export type AdminCookieStatus = {
   present: boolean;
   validFormat: boolean;
+  verified: boolean;
   message: string;
   updatedAt?: string;
   validatedAt?: string;
   status?: 'active';
+  account?: AdminCookieAccount;
 };
 
 export type StoredAdminCookie = {
@@ -18,6 +27,8 @@ export type StoredAdminCookie = {
   updatedAt: string;
   validatedAt?: string;
   status: 'active';
+  validationMode?: typeof COOKIE_VALIDATION_MODE;
+  account?: AdminCookieAccount;
 };
 
 export type AdminCookieValidationResult = {
@@ -87,10 +98,28 @@ function readStoredRecord(): StoredAdminCookie | null {
       updatedAt: parsed.updatedAt,
       validatedAt: typeof parsed.validatedAt === 'string' ? parsed.validatedAt : undefined,
       status: 'active',
+      validationMode: parsed.validationMode === COOKIE_VALIDATION_MODE ? COOKIE_VALIDATION_MODE : undefined,
+      account: sanitizeAccount(parsed.account),
     };
   } catch {
     return null;
   }
+}
+
+function sanitizeAccount(raw: unknown): AdminCookieAccount | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const value = raw as Record<string, unknown>;
+  const account: AdminCookieAccount = {};
+  if (typeof value.nickname === 'string' && value.nickname.trim()) {
+    account.nickname = value.nickname.trim().slice(0, 80);
+  }
+  if (typeof value.avatar === 'string' && value.avatar.trim()) {
+    account.avatar = value.avatar.trim().slice(0, 1000);
+  }
+  if (typeof value.userId === 'string' && value.userId.trim()) {
+    account.userId = value.userId.trim().slice(0, 120);
+  }
+  return Object.keys(account).length > 0 ? account : undefined;
 }
 
 export function getAdminCookieStatus(): AdminCookieStatus {
@@ -99,18 +128,26 @@ export function getAdminCookieStatus(): AdminCookieStatus {
     return {
       present: false,
       validFormat: false,
-      message: '未配置管理员 Cookie',
+      verified: false,
+      message: '未配置 Cookie',
     };
   }
 
   const validation = validateAdminCookie(record.cookie);
+  const verified = validation.valid && record.validationMode === COOKIE_VALIDATION_MODE;
   return {
     present: true,
     validFormat: validation.valid,
-    message: validation.valid ? '管理员 Cookie 已配置' : validation.message,
+    verified,
+    message: !validation.valid
+      ? validation.message
+      : verified
+        ? 'Cookie 已通过实效校验'
+        : 'Cookie 未通过实效校验，请重新提交',
     updatedAt: record.updatedAt,
     validatedAt: record.validatedAt,
     status: record.status,
+    account: verified ? record.account : undefined,
   };
 }
 
@@ -122,11 +159,14 @@ export function readAdminCookie(): StoredAdminCookie | null {
   if (!validation.valid) {
     return null;
   }
+  if (record.validationMode !== COOKIE_VALIDATION_MODE) {
+    return null;
+  }
 
   return record;
 }
 
-export function saveAdminCookie(rawCookie: unknown): AdminCookieStatus {
+export function saveAdminCookie(rawCookie: unknown, account?: AdminCookieAccount): AdminCookieStatus {
   const validation = validateAdminCookie(rawCookie);
   if (!validation.valid || !validation.cookie) {
     throw new AdminCookieValidationError(validation.message);
@@ -139,6 +179,8 @@ export function saveAdminCookie(rawCookie: unknown): AdminCookieStatus {
     updatedAt: now,
     validatedAt: now,
     status: 'active',
+    validationMode: COOKIE_VALIDATION_MODE,
+    account: sanitizeAccount(account),
   };
 
   fs.mkdirSync(path.dirname(storePath), { recursive: true, mode: 0o700 });

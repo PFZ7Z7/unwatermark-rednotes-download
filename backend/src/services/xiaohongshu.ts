@@ -1,6 +1,7 @@
 import axios from 'axios';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { TTLCache } from '../utils/perf';
 import { parseNoteAnonymous, AnonymousParseError, AnonymousNoteRaw } from './anonymousParser';
 import { readAdminCookie } from './adminCookieStore';
@@ -36,7 +37,7 @@ interface DownloadResult {
 // 登录失效专用异常类，方便上层识别
 export class LoginRequiredError extends Error {
   readonly needLogin = true;
-  constructor(message = '增强模式维护中，管理员 Cookie 未配置或已失效') {
+  constructor(message = '增强模式维护中，Cookie 未配置或已失效') {
     super(message);
     this.name = 'LoginRequiredError';
   }
@@ -188,6 +189,15 @@ export function mergeEnrichedNoteMedia(base: NoteInfo, enriched?: NoteInfo | nul
     creatorUrl: base.creatorUrl || enriched.creatorUrl,
     parseMode: enriched.parseMode || base.parseMode,
   };
+}
+
+export function buildCookieScopedCacheKey(kind: string, cookie: string, ...parts: Array<string | number>): string {
+  const cookieFingerprint = crypto
+    .createHash('sha256')
+    .update(cookie)
+    .digest('hex')
+    .slice(0, 16);
+  return [kind, cookieFingerprint, ...parts.map((part) => String(part))].join(':');
 }
 
 function parseMetric(value: any): number {
@@ -373,11 +383,15 @@ export function detectLoginState(): {
 }
 
 export class XiaohongshuService {
+  clearRuntimeCaches(): void {
+    resultCache.clear();
+    noteDetailCache.clear();
+  }
 
   /**
-   * 前置校验：确保 MediaCrawler 服务运行且管理员 Cookie 可用
+   * 前置校验：确保 MediaCrawler 服务运行且增强模式 Cookie 可用
    * - MediaCrawler 未运行 => LoginRequiredError
-   * - 管理员 Cookie 未配置/格式无效 => LoginRequiredError
+   * - Cookie 未配置/格式无效 => LoginRequiredError
    * 调用方法：searchNotes / getNoteDetail / getCreatorNotes 开头调用。
    */
   private async assertLoginValid(): Promise<string> {
@@ -388,10 +402,10 @@ export class XiaohongshuService {
       throw new LoginRequiredError('增强模式维护中：驱动器未运行');
     }
 
-    // 2. 读取管理员维护的 Cookie。公开用户不触发扫码登录。
+    // 2. 读取增强模式 Cookie。公开用户不触发扫码登录。
     const record = readAdminCookie();
     if (!record) {
-      throw new LoginRequiredError('增强模式维护中：管理员 Cookie 未配置或格式无效');
+      throw new LoginRequiredError('增强模式维护中：Cookie 未配置或未通过实效校验');
     }
     return record.cookie;
   }
@@ -660,8 +674,16 @@ export class XiaohongshuService {
     }
   }
 
-  async enrichNotesMedia(notes: NoteInfo[], concurrency: number = 5): Promise<NoteInfo[]> {
-    return mapWithConcurrency(notes, concurrency, (note) => this.enrichNoteMedia(note));
+  async enrichNotesMedia(
+    notes: NoteInfo[],
+    concurrency: number = 5,
+    onNoteEnriched?: (note: NoteInfo, index: number) => void
+  ): Promise<NoteInfo[]> {
+    return mapWithConcurrency(notes, concurrency, async (note, index) => {
+      const enriched = await this.enrichNoteMedia(note);
+      onNoteEnriched?.(enriched, index);
+      return enriched;
+    });
   }
 
   /**
@@ -932,7 +954,7 @@ export class XiaohongshuService {
     const adminCookie = await this.assertLoginValid();
 
     // 缓存命中则直接返回（避免重复请求 MediaCrawler 重启浏览器）
-    const cacheKey = `search:${keywords.trim()}:${maxCount}`;
+    const cacheKey = buildCookieScopedCacheKey('search', adminCookie, keywords.trim(), maxCount);
     const cached = resultCache.get(cacheKey);
     if (cached) {
       console.log(`[搜索][缓存命中] keywords=${keywords}，返回 ${cached.length} 条缓存结果`);
@@ -982,7 +1004,7 @@ export class XiaohongshuService {
           throw new Error(`搜索超时且未爬到任何笔记（关键词可能过于冷门，建议换关键词或调小数量）`);
         }
         throw new LoginRequiredError(
-          '本次搜索未获取到新数据，可能是管理员 Cookie 已失效或被风控，请等待管理员更新后重试'
+          '本次搜索未获取到新数据，可能是 Cookie 已失效或被风控，请更新 Cookie 后重试'
         );
       }
 
@@ -1241,7 +1263,7 @@ export class XiaohongshuService {
     }
 
     // 缓存命中则直接返回
-    const cacheKey = `creator:${userId}:${maxCount}`;
+    const cacheKey = buildCookieScopedCacheKey('creator', adminCookie, userId, maxCount);
     const cached = resultCache.get(cacheKey);
     if (cached) {
       console.log(`[博主][缓存命中] userId=${userId}，返回 ${cached.length} 条缓存结果`);

@@ -3,15 +3,19 @@
 # 小红书无水印下载工具 · 单镜像多阶段构建
 # 架构：前端构建 → 后端构建 → 精简 runtime
 # 运行时：express 托管前端静态资源 + /api，3001 端口单入口
-# MediaCrawler 不在本镜像内，通过 host.docker.internal:8080 访问
+# 增强模式驱动器不在本镜像内，默认由 docker-compose 的 xhs-driver sidecar 提供
 # ─────────────────────────────────────────────────────────────
 
+ARG NODE_IMAGE=node:20-slim
+
 # ============ Stage 1: 前端构建 ============
-FROM node:20-slim AS frontend-build
+FROM ${NODE_IMAGE} AS frontend-build
 WORKDIR /app/frontend
+ARG NPM_REGISTRY=https://registry.npmjs.org/
 
 # 先装依赖（缓存层）
 COPY frontend/package.json frontend/package-lock.json ./
+RUN npm config set registry "${NPM_REGISTRY}"
 RUN npm ci --no-audit --no-fund
 
 # 再拷源码 build
@@ -21,16 +25,25 @@ RUN npm run build
 
 
 # ============ Stage 2: 后端构建（含 native 模块编译） ============
-FROM node:20-slim AS backend-build
+FROM ${NODE_IMAGE} AS backend-build
 WORKDIR /app/backend
+ARG NPM_REGISTRY=https://registry.npmjs.org/
+ARG USE_ALIYUN_APT_MIRROR=false
 
 # better-sqlite3 需要编译 native 模块：python3 + make + g++
-RUN apt-get update \
+RUN if [ "${USE_ALIYUN_APT_MIRROR}" = "true" ]; then \
+        sed -i \
+          -e 's|http://deb.debian.org/debian|http://mirrors.cloud.aliyuncs.com/debian|g' \
+          -e 's|http://deb.debian.org/debian-security|http://mirrors.cloud.aliyuncs.com/debian-security|g' \
+          /etc/apt/sources.list.d/debian.sources; \
+    fi \
+    && apt-get update \
     && apt-get install -y --no-install-recommends python3 make g++ \
     && rm -rf /var/lib/apt/lists/*
 
 # 先装依赖（包含 devDependencies，tsc 需要 @types/*）
 COPY backend/package.json backend/package-lock.json ./
+RUN npm config set registry "${NPM_REGISTRY}"
 RUN npm ci --no-audit --no-fund
 
 # 编译 TypeScript
@@ -44,14 +57,14 @@ RUN npm prune --omit=dev
 
 
 # ============ Stage 3: runtime（最小镜像） ============
-FROM node:20-slim AS runtime
+FROM ${NODE_IMAGE} AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production
 ENV PORT=3001
 ENV FRONTEND_DIST=/app/frontend-dist
 
-# 非 root 运行；/app/runtime 用于持久化管理员 Cookie
+# 非 root 运行；/app/runtime 用于持久化增强模式共享 Cookie
 RUN groupadd -r xhs \
     && useradd -r -g xhs -d /app -s /usr/sbin/nologin xhs \
     && mkdir -p /app/runtime \

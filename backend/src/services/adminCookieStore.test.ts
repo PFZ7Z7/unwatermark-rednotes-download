@@ -35,16 +35,24 @@ describe('admin cookie store', () => {
   });
 
   test('stores a valid cookie and returns safe metadata only', () => {
-    const status = saveAdminCookie('a=1; web_session=session-value; webId=abc');
+    const status = saveAdminCookie('a=1; web_session=session-value; webId=abc', {
+      nickname: 'tester',
+      avatar: 'https://example.com/avatar.jpg',
+      userId: 'user_1',
+    });
 
     assert.equal(status.present, true);
     assert.equal(status.validFormat, true);
+    assert.equal(status.verified, true);
+    assert.equal(status.account?.nickname, 'tester');
     assert.equal(typeof status.updatedAt, 'string');
     assert.equal('cookie' in status, false);
 
     const raw = fs.readFileSync(process.env.XHS_COOKIE_STORE_PATH!, 'utf8');
     const parsed = JSON.parse(raw);
     assert.equal(parsed.cookie, 'a=1; web_session=session-value; webId=abc');
+    assert.equal(parsed.validationMode, 'selfinfo-v2');
+    assert.equal(parsed.account.nickname, 'tester');
     assert.equal(fs.statSync(process.env.XHS_COOKIE_STORE_PATH!).mode & 0o777, 0o600);
   });
 
@@ -55,6 +63,24 @@ describe('admin cookie store', () => {
 
     assert.equal(record?.cookie, 'web_session=session-value; webId=abc');
     assert.equal(record?.status, 'active');
+  });
+
+  test('does not treat legacy format-only records as verified login state', () => {
+    const storePath = process.env.XHS_COOKIE_STORE_PATH!;
+    fs.mkdirSync(path.dirname(storePath), { recursive: true });
+    fs.writeFileSync(storePath, JSON.stringify({
+      cookie: 'web_session=legacy-session',
+      updatedAt: new Date().toISOString(),
+      validatedAt: new Date().toISOString(),
+      status: 'active',
+    }));
+
+    const status = getAdminCookieStatus();
+
+    assert.equal(status.present, true);
+    assert.equal(status.validFormat, true);
+    assert.equal(status.verified, false);
+    assert.equal(readAdminCookie(), null);
   });
 
   test('clear removes the stored cookie and reports missing status', () => {

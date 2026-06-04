@@ -26,6 +26,7 @@ RUN if [ "${USE_ALIYUN_APT_MIRROR}" = "true" ]; then \
       ca-certificates \
       curl \
       git \
+      nodejs \
     && rm -rf /var/lib/apt/lists/*
 
 RUN git init MediaCrawler \
@@ -76,6 +77,10 @@ if "install_xhs_cookie_validation(app)" not in main_text:
 
 manager = Path("api/services/crawler_manager.py")
 manager_text = manager.read_text(encoding="utf-8")
+manager_text = manager_text.replace(
+    'cmd = ["uv", "run", "python", "main.py"]',
+    'cmd = ["python", "main.py"]',
+)
 old = '''entry = self._create_log_entry(f"Starting crawler: {' '.join(cmd)}", "info")'''
 new = '''safe_cmd = [
                 "***" if index > 0 and cmd[index - 1] == "--cookies" else value
@@ -83,7 +88,19 @@ new = '''safe_cmd = [
             ]
             entry = self._create_log_entry(f"Starting crawler: {' '.join(safe_cmd)}", "info")'''
 if old in manager_text:
-    manager.write_text(manager_text.replace(old, new), encoding="utf-8")
+    manager_text = manager_text.replace(old, new)
+manager.write_text(manager_text, encoding="utf-8")
+
+main_text = main.read_text(encoding="utf-8")
+main_text = main_text.replace(
+    '["uv", "run", "main.py", "--help"]',
+    '["python", "main.py", "--help"]',
+)
+main_text = main_text.replace(
+    '"uv", "run", "main.py", "--help",',
+    '"python", "main.py", "--help",',
+)
+main.write_text(main_text, encoding="utf-8")
 PY
 
 EXPOSE 8080

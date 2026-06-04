@@ -1,10 +1,12 @@
 import axios from 'axios';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { TTLCache } from '../utils/perf';
 import { parseNoteAnonymous, AnonymousParseError, AnonymousNoteRaw } from './anonymousParser';
+import { readAdminCookie } from './adminCookieStore';
 
-interface NoteInfo {
+export interface NoteInfo {
   noteId: string;
   title: string;
   desc: string;
@@ -35,7 +37,7 @@ interface DownloadResult {
 // 登录失效专用异常类，方便上层识别
 export class LoginRequiredError extends Error {
   readonly needLogin = true;
-  constructor(message = '登录状态失效，请先扫码登录') {
+  constructor(message = '增强模式维护中，Cookie 未配置或已失效') {
     super(message);
     this.name = 'LoginRequiredError';
   }
@@ -78,10 +80,151 @@ const USER_PROFILE_PATTERN = /user\/profile\/([a-zA-Z0-9]+)/;
 const UNICODE_SLASH_PATTERN = /\\u002F/g;
 const WATERMARK_PATH_PATTERN = /\/watermark\/.*/g;
 
+type MediaCrawlerListType = 'search' | 'creator';
+
+type BuildMediaCrawlerStartPayloadInput = {
+  crawlerType: MediaCrawlerListType;
+  cookies: string;
+  maxCount: number;
+  keywords?: string;
+  creatorId?: string;
+};
+
+export type MediaCrawlerStartPayload = {
+  platform: 'xhs';
+  login_type: 'cookie';
+  cookies: string;
+  crawler_type: MediaCrawlerListType;
+  keywords?: string;
+  creator_ids?: string;
+  max_notes_count: number;
+  max_concurrency_num: number;
+  enable_comments: false;
+  save_option: 'json';
+  headless: true;
+};
+
+export function buildMediaCrawlerStartPayload(input: BuildMediaCrawlerStartPayloadInput): MediaCrawlerStartPayload {
+  const base = {
+    platform: 'xhs' as const,
+    login_type: 'cookie' as const,
+    cookies: input.cookies,
+    crawler_type: input.crawlerType,
+    max_notes_count: input.maxCount,
+    max_concurrency_num: MEDIACRAWLER_CONCURRENCY,
+    enable_comments: false as const,
+    save_option: 'json' as const,
+    headless: true as const,
+  };
+
+  if (input.crawlerType === 'creator') {
+    return {
+      ...base,
+      crawler_type: 'creator',
+      creator_ids: input.creatorId || '',
+    };
+  }
+
+  return {
+    ...base,
+    crawler_type: 'search',
+    keywords: input.keywords || '',
+  };
+}
+
+export type CrawlerLogProgress = {
+  discoveredCount: number;
+  detailTaskCount: number;
+};
+
+export function parseCrawlerLogProgress(logs: Array<{ message?: string } | string>): CrawlerLogProgress {
+  let discoveredCount = 0;
+  const detailNoteIds = new Set<string>();
+
+  for (const entry of logs) {
+    const message = typeof entry === 'string' ? entry : String(entry?.message || '');
+    if (!message) continue;
+
+    const creatorMatch = message.match(/notes len\s*:\s*(\d+)/i);
+    if (creatorMatch) {
+      discoveredCount += Number(creatorMatch[1]) || 0;
+    }
+
+    const detailMatches = message.matchAll(/Begin get note detail,\s*note_id:\s*([a-zA-Z0-9_-]+)/g);
+    for (const match of detailMatches) {
+      detailNoteIds.add(match[1]);
+    }
+
+    if (message.includes('Search notes response')) {
+      const modelTypeMatches = message.matchAll(/['"]model_type['"]\s*:\s*['"]([^'"]+)['"]/g);
+      for (const match of modelTypeMatches) {
+        if (match[1] !== 'rec_query' && match[1] !== 'hot_query') {
+          discoveredCount++;
+        }
+      }
+    }
+  }
+
+  return {
+    discoveredCount: Math.max(discoveredCount, detailNoteIds.size),
+    detailTaskCount: detailNoteIds.size,
+  };
+}
+
+export function mergeEnrichedNoteMedia(base: NoteInfo, enriched?: NoteInfo | null): NoteInfo {
+  if (!enriched) return base;
+
+  const hasEnrichedImages = Array.isArray(enriched.images) && enriched.images.length > 0;
+  const hasEnrichedLivePhotos = Array.isArray(enriched.livePhotos) && enriched.livePhotos.length > 0;
+  const hasEnrichedVideo = Boolean(enriched.video?.url);
+
+  return {
+    ...base,
+    type: hasEnrichedVideo ? 'video' : (enriched.type || base.type),
+    images: hasEnrichedImages ? enriched.images : base.images,
+    livePhotos: hasEnrichedLivePhotos ? enriched.livePhotos : base.livePhotos,
+    video: hasEnrichedVideo ? enriched.video : base.video,
+    hasWatermark: hasEnrichedVideo ? enriched.hasWatermark : base.hasWatermark,
+    noteUrl: base.noteUrl || enriched.noteUrl,
+    creatorUrl: base.creatorUrl || enriched.creatorUrl,
+    parseMode: enriched.parseMode || base.parseMode,
+  };
+}
+
+export function buildCookieScopedCacheKey(kind: string, cookie: string, ...parts: Array<string | number>): string {
+  const cookieFingerprint = crypto
+    .createHash('sha256')
+    .update(cookie)
+    .digest('hex')
+    .slice(0, 16);
+  return [kind, cookieFingerprint, ...parts.map((part) => String(part))].join(':');
+}
+
 function parseMetric(value: any): number {
   if (typeof value === 'number' && Number.isFinite(value)) return value;
   const n = parseInt(String(value || ''), 10);
   return Number.isFinite(n) ? n : 0;
+}
+
+async function mapWithConcurrency<T, R>(
+  items: T[],
+  concurrency: number,
+  mapper: (item: T, index: number) => Promise<R>
+): Promise<R[]> {
+  const limit = Math.max(1, Math.floor(concurrency));
+  const results = new Array<R>(items.length);
+  let nextIndex = 0;
+
+  async function worker() {
+    while (nextIndex < items.length) {
+      const currentIndex = nextIndex++;
+      results[currentIndex] = await mapper(items[currentIndex], currentIndex);
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(limit, items.length) }, () => worker());
+  await Promise.all(workers);
+  return results;
 }
 
 /**
@@ -240,26 +383,31 @@ export function detectLoginState(): {
 }
 
 export class XiaohongshuService {
+  clearRuntimeCaches(): void {
+    resultCache.clear();
+    noteDetailCache.clear();
+  }
 
   /**
-   * 前置校验：确保 MediaCrawler 服务运行且登录态有效
+   * 前置校验：确保 MediaCrawler 服务运行且增强模式 Cookie 可用
    * - MediaCrawler 未运行 => LoginRequiredError
-   * - Cookies 文件不存在/过小 => LoginRequiredError
+   * - Cookie 未配置/格式无效 => LoginRequiredError
    * 调用方法：searchNotes / getNoteDetail / getCreatorNotes 开头调用。
    */
-  private async assertLoginValid(): Promise<void> {
+  private async assertLoginValid(): Promise<string> {
     // 1. MediaCrawler 服务是否在线
     try {
       await axios.get(`${MEDIACRAWLER_API}/api/crawler/status`, { timeout: 5000 });
     } catch {
-      throw new LoginRequiredError('MediaCrawler 服务未运行，无法校验登录态');
+      throw new LoginRequiredError('增强模式维护中：驱动器未运行');
     }
 
-    // 2. 统一登录态检测（与 /api/login-status 同源）
-    const { valid, message } = detectLoginState();
-    if (!valid) {
-      throw new LoginRequiredError(message);
+    // 2. 读取增强模式 Cookie。公开用户不触发扫码登录。
+    const record = readAdminCookie();
+    if (!record) {
+      throw new LoginRequiredError('增强模式维护中：Cookie 未配置或未通过实效校验');
     }
+    return record.cookie;
   }
 
   /**
@@ -416,7 +564,7 @@ export class XiaohongshuService {
     }
 
     // 【2】Fallback 路径：MediaCrawler（需要登录）
-    await this.assertLoginValid();
+    const adminCookie = await this.assertLoginValid();
     await this.ensureCrawlerReady(isTaskActive);
 
     try {
@@ -426,6 +574,7 @@ export class XiaohongshuService {
       await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, {
         platform: 'xhs',
         login_type: 'cookie',
+        cookies: adminCookie,
         crawler_type: 'detail',
         specified_ids: specifiedId,
         enable_comments: false,
@@ -498,6 +647,43 @@ export class XiaohongshuService {
       console.error(`[MediaCrawler] 错误: ${error.message}`);
       throw new Error(`解析失败: ${error.message}`);
     }
+  }
+
+  async enrichNoteMedia(note: NoteInfo): Promise<NoteInfo> {
+    const rawTarget = note.noteUrl || note.noteId || '';
+    if (!rawTarget) return note;
+
+    const { noteId, fullUrl } = await this.parseNoteUrl(rawTarget);
+    const effectiveNoteId = noteId || note.noteId;
+    if (!effectiveNoteId) return note;
+
+    const enrichUrl = fullUrl || note.noteUrl || `https://www.xiaohongshu.com/explore/${effectiveNoteId}`;
+    const cacheKey = fullUrl ? `detail:${fullUrl}` : `detail:${effectiveNoteId}`;
+    const cached = noteDetailCache.get(cacheKey);
+    if (cached) return mergeEnrichedNoteMedia(note, cached);
+
+    try {
+      const raw = await parseNoteAnonymous(enrichUrl);
+      const enriched = this.mapAnonymousToNoteInfo(raw, effectiveNoteId);
+      noteDetailCache.set(cacheKey, enriched);
+      return mergeEnrichedNoteMedia(note, enriched);
+    } catch (e: any) {
+      const reason = e instanceof AnonymousParseError ? (e.reason || 'unknown') : 'exception';
+      console.warn(`[补全][匿名解析失败，保留原媒体] noteId=${effectiveNoteId}, reason=${reason}, msg=${e.message}`);
+      return note;
+    }
+  }
+
+  async enrichNotesMedia(
+    notes: NoteInfo[],
+    concurrency: number = 5,
+    onNoteEnriched?: (note: NoteInfo, index: number) => void
+  ): Promise<NoteInfo[]> {
+    return mapWithConcurrency(notes, concurrency, async (note, index) => {
+      const enriched = await this.enrichNoteMedia(note);
+      onNoteEnriched?.(enriched, index);
+      return enriched;
+    });
   }
 
   /**
@@ -765,10 +951,10 @@ export class XiaohongshuService {
    */
   async searchNotes(keywords: string, maxCount: number = 20, taskId?: number, isTaskActive?: () => boolean): Promise<NoteInfo[]> {
     // 登录态前置校验
-    await this.assertLoginValid();
+    const adminCookie = await this.assertLoginValid();
 
     // 缓存命中则直接返回（避免重复请求 MediaCrawler 重启浏览器）
-    const cacheKey = `search:${keywords.trim()}:${maxCount}`;
+    const cacheKey = buildCookieScopedCacheKey('search', adminCookie, keywords.trim(), maxCount);
     const cached = resultCache.get(cacheKey);
     if (cached) {
       console.log(`[搜索][缓存命中] keywords=${keywords}，返回 ${cached.length} 条缓存结果`);
@@ -787,20 +973,15 @@ export class XiaohongshuService {
       // 记录本次任务开始时间戳（过滤「本次新爬」数据，减 5s 缓冲区防时钟小偏差）
       const searchStartTs = Date.now() - 5000;
 
-      // 1. 启动搜索爬虫（透传 max_notes 与并发度）
-      await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, {
-        platform: 'xhs',
-        login_type: 'cookie',
-        crawler_type: 'search',
+      // 1. 启动搜索爬虫（透传 max_notes_count 与并发度）
+      await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, buildMediaCrawlerStartPayload({
+        crawlerType: 'search',
+        cookies: adminCookie,
+        maxCount,
         keywords: keywords,
-        max_notes: maxCount,
-        max_concurrency_num: MEDIACRAWLER_CONCURRENCY,
-        enable_comments: false,
-        save_option: 'json',
-        headless: true
-      }, { timeout: 30000 });
+      }), { timeout: 30000 });
 
-      console.log(`[MediaCrawler] 搜索任务已启动，关键词: ${keywords}，max_notes=${maxCount}，concurrency=${MEDIACRAWLER_CONCURRENCY}`);
+      console.log(`[MediaCrawler] 搜索任务已启动，关键词: ${keywords}，max_notes_count=${maxCount}，concurrency=${MEDIACRAWLER_CONCURRENCY}`);
 
       // 2. 等待任务完成（600s 兜底，超时不抛错。主路径是用户从前端手动「提前结束」触发取消）
       const { timedOut } = await this.waitForCrawlerComplete(600, isTaskActive);
@@ -823,7 +1004,7 @@ export class XiaohongshuService {
           throw new Error(`搜索超时且未爬到任何笔记（关键词可能过于冷门，建议换关键词或调小数量）`);
         }
         throw new LoginRequiredError(
-          '本次搜索未获取到新数据，可能是登录态已失效或 Cookies 被风控，请重新扫码登录后重试'
+          '本次搜索未获取到新数据，可能是 Cookie 已失效或被风控，请更新 Cookie 后重试'
         );
       }
 
@@ -837,6 +1018,9 @@ export class XiaohongshuService {
 
     } catch (error: any) {
       console.error(`[搜索] 错误: ${error.message}`);
+      if (error instanceof LoginRequiredError || error?.needLogin === true) {
+        throw error;
+      }
       throw new Error(`搜索失败: ${error.message}`);
     }
   }
@@ -1064,7 +1248,7 @@ export class XiaohongshuService {
    */
   async getCreatorNotes(url: string, maxCount: number = 30, taskId?: number, isTaskActive?: () => boolean): Promise<NoteInfo[]> {
     // 登录态前置校验
-    await this.assertLoginValid();
+    const adminCookie = await this.assertLoginValid();
 
     console.log(`[博主] URL: ${url}`);
 
@@ -1079,7 +1263,7 @@ export class XiaohongshuService {
     }
 
     // 缓存命中则直接返回
-    const cacheKey = `creator:${userId}:${maxCount}`;
+    const cacheKey = buildCookieScopedCacheKey('creator', adminCookie, userId, maxCount);
     const cached = resultCache.get(cacheKey);
     if (cached) {
       console.log(`[博主][缓存命中] userId=${userId}，返回 ${cached.length} 条缓存结果`);
@@ -1097,19 +1281,14 @@ export class XiaohongshuService {
       const crawlStartTs = Date.now() - 5000;
 
       // 1. 启动创作者爬虫（creator_ids 必须传博主 ID，不能传整段 URL）
-      await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, {
-        platform: 'xhs',
-        login_type: 'cookie',
-        crawler_type: 'creator',
-        creator_ids: userId,
-        max_notes: maxCount,
-        max_concurrency_num: MEDIACRAWLER_CONCURRENCY,
-        enable_comments: false,
-        save_option: 'json',
-        headless: true
-      }, { timeout: 30000 });
+      await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, buildMediaCrawlerStartPayload({
+        crawlerType: 'creator',
+        cookies: adminCookie,
+        maxCount,
+        creatorId: userId,
+      }), { timeout: 30000 });
 
-      console.log(`[MediaCrawler] 博主任务已启动，userId=${userId}，max_notes=${maxCount}，concurrency=${MEDIACRAWLER_CONCURRENCY}`);
+      console.log(`[MediaCrawler] 博主任务已启动，userId=${userId}，max_notes_count=${maxCount}，concurrency=${MEDIACRAWLER_CONCURRENCY}`);
 
       // 2. 等待任务完成（600s 兜底，超时不抛错。主路径是用户手动「提前结束」）
       const { timedOut } = await this.waitForCrawlerComplete(600, isTaskActive);
@@ -1134,6 +1313,9 @@ export class XiaohongshuService {
 
     } catch (error: any) {
       console.error(`[博主] 错误: ${error.message}`);
+      if (error instanceof LoginRequiredError || error?.needLogin === true) {
+        throw error;
+      }
       throw new Error(`获取博主笔记失败: ${error.message}`);
     }
   }
@@ -1198,6 +1380,9 @@ export class XiaohongshuService {
    */
   async getLiveProgress(mode: 'search' | 'creator', key: string, sinceMs?: number): Promise<{
     count: number;
+    parsedCount: number;
+    discoveredCount: number;
+    detailTaskCount: number;
     status: 'running' | 'idle' | 'error' | 'unknown';
   }> {
     // 1. 拿 MediaCrawler 状态（任何异常都归为 unknown）
@@ -1210,6 +1395,17 @@ export class XiaohongshuService {
       // 服务不在就当 unknown，不报错
     }
 
+    let logProgress: CrawlerLogProgress = { discoveredCount: 0, detailTaskCount: 0 };
+    try {
+      const logResponse = await axios.get(`${MEDIACRAWLER_API}/api/crawler/logs`, {
+        params: { limit: 300 },
+        timeout: 5000,
+      });
+      logProgress = parseCrawlerLogProgress(logResponse.data?.logs || []);
+    } catch {
+      // 日志只是进度增强来源，失败不影响主流程。
+    }
+
     // 2. 拿文件列表（文件还没生成时 count=0）
     let files: any[] = [];
     try {
@@ -1219,9 +1415,9 @@ export class XiaohongshuService {
       });
       files = r.data?.files || [];
     } catch {
-      return { count: 0, status };
+      return { count: 0, parsedCount: 0, discoveredCount: logProgress.discoveredCount, detailTaskCount: logProgress.detailTaskCount, status };
     }
-    if (!files.length) return { count: 0, status };
+    if (!files.length) return { count: 0, parsedCount: 0, discoveredCount: logProgress.discoveredCount, detailTaskCount: logProgress.detailTaskCount, status };
 
     // 3. 根据模式选文件
     const target = mode === 'search'
@@ -1229,7 +1425,7 @@ export class XiaohongshuService {
       : (files.find((f: any) => String(f.path).includes('creator'))
           || files.find((f: any) => String(f.path).includes('detail'))
           || files[0]);
-    if (!target) return { count: 0, status };
+    if (!target) return { count: 0, parsedCount: 0, discoveredCount: logProgress.discoveredCount, detailTaskCount: logProgress.detailTaskCount, status };
 
     // 4. 读文件内容，容忍任何解析错误
     let noteDataList: any[] = [];
@@ -1241,7 +1437,7 @@ export class XiaohongshuService {
       const raw = c.data?.data || c.data;
       if (Array.isArray(raw)) noteDataList = raw;
     } catch {
-      return { count: 0, status };
+      return { count: 0, parsedCount: 0, discoveredCount: logProgress.discoveredCount, detailTaskCount: logProgress.detailTaskCount, status };
     }
 
     // 5. 按 key 和 sinceMs 单次扫描计数，返回「本次新爬」的数目（与最终结果口径对齐）
@@ -1265,7 +1461,14 @@ export class XiaohongshuService {
       }
       count++;
     }
-    return { count, status };
+    const discoveredCount = Math.max(logProgress.discoveredCount, count);
+    return {
+      count,
+      parsedCount: count,
+      discoveredCount,
+      detailTaskCount: logProgress.detailTaskCount,
+      status,
+    };
   }
 
   /**

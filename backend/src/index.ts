@@ -4,13 +4,25 @@ import dotenv from 'dotenv';
 import archiver from 'archiver';
 import path from 'path';
 import fs from 'fs';
-import { XiaohongshuService, LoginRequiredError, detectLoginState } from './services/xiaohongshu';
+import { XiaohongshuService, LoginRequiredError, type NoteInfo } from './services/xiaohongshu';
+import { createDownloadJobStore } from './services/downloadJobStore';
+import {
+  AdminCookieValidationError,
+  clearAdminCookie,
+  getAdminCookieStatus,
+  saveAdminCookie,
+} from './services/adminCookieStore';
+import { verifyXhsCookie, XhsCookieVerificationError } from './services/xhsCookieValidator';
 import axios from 'axios';
 
 dotenv.config();
 
 const app = express();
 const PORT = process.env.PORT || 3001;
+const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
+
+const ENHANCED_MODE_READY_MESSAGE = '增强模式已可用';
+const ENHANCED_MODE_MAINTENANCE_MESSAGE = '增强模式维护中，普通链接下载不受影响';
 
 // 将任意错误归一化为 JSON，登录错误带上 needLogin=true
 function sendError(res: Response, err: any, fallbackStatus = 500) {
@@ -21,8 +33,8 @@ function sendError(res: Response, err: any, fallbackStatus = 500) {
     return res.status(401).json({
       success: false,
       needLogin: true,
-      message: err?.message || '登录状态失效，请先扫码登录',
-      hint: '点击「扫码登录」按钮进行登录'
+      message: err?.message || ENHANCED_MODE_MAINTENANCE_MESSAGE,
+      hint: '请在右上角启用增强模式；普通链接下载不受影响'
     });
   }
   return res.status(fallbackStatus).json({
@@ -39,10 +51,26 @@ const PROXY_ALLOWED_HOSTS = (process.env.PROXY_ALLOWED_HOSTS || 'xhscdn.com,xhsc
 
 const JSON_BODY_LIMIT = process.env.JSON_BODY_LIMIT || '1mb';
 const MAX_ZIP_ITEMS = Math.max(1, Number(process.env.MAX_ZIP_ITEMS || 500));
+const MEDIA_ENRICH_CONCURRENCY = Math.max(1, Number(process.env.MEDIA_ENRICH_CONCURRENCY || 5));
+const ZIP_COMPRESSION_LEVEL = Math.min(9, Math.max(0, Number(process.env.ZIP_COMPRESSION_LEVEL || 3)));
+const DOWNLOAD_JOB_TTL_MS = Math.max(60_000, Number(process.env.DOWNLOAD_JOB_TTL_MS || 30 * 60 * 1000));
+const DOWNLOAD_JOB_MAX_JOBS = Math.max(1, Number(process.env.DOWNLOAD_JOB_MAX_JOBS || 50));
 const RUNTIME_CLEANUP_INTERVAL_MS = Math.max(
   60_000,
   Number(process.env.RUNTIME_CLEANUP_INTERVAL_MS || 6 * 60 * 60 * 1000)
 );
+
+type DownloadItem = {
+  url: string;
+  filename: string;
+  fallbackUrls?: string[];
+};
+
+const DOWNLOAD_JOB_ID_PATTERN = /^[a-f0-9]{24}$/i;
+const downloadJobs = createDownloadJobStore<NoteInfo, DownloadItem>({
+  ttlMs: DOWNLOAD_JOB_TTL_MS,
+  maxJobs: DOWNLOAD_JOB_MAX_JOBS,
+});
 
 function isAllowedProxyUrl(rawUrl: string): boolean {
   try {
@@ -83,6 +111,11 @@ function parseFallbackUrls(raw: unknown): string[] {
   }
 }
 
+function getSingleParam(value: unknown): string {
+  if (Array.isArray(value)) return typeof value[0] === 'string' ? value[0] : '';
+  return typeof value === 'string' ? value : '';
+}
+
 function createUniqueFilename(filename: string, used: Set<string>): string {
   if (!used.has(filename)) {
     used.add(filename);
@@ -116,6 +149,135 @@ function waitForReadableEnd(stream: NodeJS.ReadableStream): Promise<void> {
   });
 }
 
+function collectDownloadItems(notes: NoteInfo[]): DownloadItem[] {
+  const downloadItems: DownloadItem[] = [];
+  const usedFilenames = new Set<string>();
+  for (const note of notes) {
+    const noteId = sanitizeFileSegment(note?.noteId, 'note');
+    if (note.type === 'video' && note.video?.url && isAllowedProxyUrl(note.video.url)) {
+      const filename = createUniqueFilename(`${noteId}_video.mp4`, usedFilenames);
+      downloadItems.push({
+        url: note.video.url,
+        filename,
+        fallbackUrls: Array.isArray(note.video.backupUrls) ? note.video.backupUrls : undefined,
+      });
+    } else if (note.images && note.images.length > 0) {
+      const livePhotoImageIndexes = new Set<number>();
+      if (Array.isArray(note.livePhotos) && note.livePhotos.length > 0) {
+        note.livePhotos.forEach((item: any, idx: number) => {
+          const liveIndex = Number.isInteger(item?.index) ? Number(item.index) : idx;
+          if (isAllowedProxyUrl(item?.imageUrl)) {
+            livePhotoImageIndexes.add(liveIndex);
+            downloadItems.push({
+              url: item.imageUrl,
+              filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.jpg`, usedFilenames),
+            });
+          }
+          if (isAllowedProxyUrl(item?.videoUrl)) {
+            downloadItems.push({
+              url: item.videoUrl,
+              filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.mp4`, usedFilenames),
+              fallbackUrls: Array.isArray(item?.videoUrls)
+                ? item.videoUrls.filter((url: string) => url !== item.videoUrl)
+                : undefined,
+            });
+          }
+        });
+      }
+
+      note.images.forEach((img: string, idx: number) => {
+        if (!livePhotoImageIndexes.has(idx) && isAllowedProxyUrl(img)) {
+          downloadItems.push({
+            url: img,
+            filename: createUniqueFilename(`${noteId}_img${idx + 1}.jpg`, usedFilenames),
+          });
+        }
+      });
+    }
+  }
+  return downloadItems;
+}
+
+function buildDownloadJobPayload(jobId: string) {
+  const progress = downloadJobs.getProgress(jobId);
+  if (!progress) return null;
+  return {
+    ...progress,
+    progressUrl: `/api/download-jobs/${jobId}/progress`,
+    downloadUrl: `/api/download-jobs/${jobId}/file`,
+  };
+}
+
+async function streamZipDownloadItems(
+  downloadItems: DownloadItem[],
+  res: Response,
+  options: { jobId?: string } = {}
+): Promise<void> {
+  res.setHeader('Content-Type', 'application/zip');
+  res.setHeader('Content-Disposition', `attachment; filename="xiaohongshu_${Date.now()}.zip"`);
+
+  const archive = archiver('zip', { zlib: { level: ZIP_COMPRESSION_LEVEL } });
+  archive.on('warning', (err) => {
+    console.warn(`[打包] ZIP 警告: ${err.message}`);
+  });
+  archive.on('error', (err) => {
+    console.error(`[打包] ZIP 错误: ${err.message}`);
+    if (options.jobId) downloadJobs.markFailed(options.jobId, err);
+    if (!res.destroyed) res.destroy(err);
+  });
+  archive.pipe(res);
+
+  const failedItems: string[] = [];
+  for (const item of downloadItems) {
+    const candidateUrls = Array.from(new Set([
+      item.url,
+      ...(item.fallbackUrls || []),
+    ])).filter(isAllowedProxyUrl);
+    let added = false;
+    let lastError = '';
+
+    for (const candidateUrl of candidateUrls) {
+      if (added) break;
+      try {
+        const response = await axios.get(candidateUrl, {
+          responseType: 'stream',
+          headers: {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Referer': 'https://www.xiaohongshu.com/',
+          },
+          timeout: 30000,
+        });
+        if (options.jobId) {
+          response.data.on('data', (chunk: Buffer) => {
+            downloadJobs.recordFileBytes(options.jobId!, chunk.length);
+          });
+        }
+        archive.append(response.data, { name: item.filename });
+        await waitForReadableEnd(response.data);
+        if (options.jobId) downloadJobs.recordFileAdded(options.jobId);
+        console.log(`[打包] 流式添加: ${item.filename}`);
+        added = true;
+      } catch (err: any) {
+        lastError = err.message;
+        console.error(`[打包] 失败: ${item.filename} - ${err.message}`);
+      }
+    }
+
+    if (!added) {
+      failedItems.push(`${item.filename}: ${lastError || '所有备用地址均不可用'}`);
+    }
+  }
+
+  if (failedItems.length > 0) {
+    archive.append(
+      `以下文件下载失败，已跳过：\n${failedItems.join('\n')}\n`,
+      { name: '_download_errors.txt' }
+    );
+  }
+
+  await archive.finalize();
+}
+
 // CORS 白名单：生产环境通过 ALLOWED_ORIGINS 注入；同源 Nginx 反代场景下会留空，
 // 此时不会出现跨域请求（同域），保留白名单仅作纵深防御。
 // 开发态默认允许 Vite dev server (5173) 和 backend 本身 (3001)
@@ -144,6 +306,82 @@ app.use(express.json({ limit: JSON_BODY_LIMIT }));
 
 const xhsService = new XiaohongshuService();
 
+async function prepareDownloadJob(jobId: string): Promise<void> {
+  const job = downloadJobs.get(jobId);
+  if (!job) return;
+
+  try {
+    downloadJobs.markEnriching(jobId);
+    const enrichedNotes = await xhsService.enrichNotesMedia(
+      job.notes,
+      MEDIA_ENRICH_CONCURRENCY,
+      () => downloadJobs.recordNoteEnriched(jobId)
+    );
+    const downloadItems = collectDownloadItems(enrichedNotes);
+    if (downloadItems.length === 0) {
+      throw new Error('没有可下载的内容');
+    }
+    if (downloadItems.length > MAX_ZIP_ITEMS) {
+      throw new Error(`一次最多打包 ${MAX_ZIP_ITEMS} 个文件，请减少选择数量或调整 MAX_ZIP_ITEMS`);
+    }
+    downloadJobs.setDownloadItems(jobId, downloadItems);
+    downloadJobs.markReady(jobId, downloadItems.length);
+  } catch (error) {
+    downloadJobs.markFailed(jobId, error);
+  }
+}
+
+type MediaCrawlerSnapshot = {
+  driverRunning: boolean;
+  message: string;
+};
+
+async function getMediaCrawlerSnapshot(): Promise<MediaCrawlerSnapshot> {
+  try {
+    await axios.get(`${MEDIACRAWLER_API}/api/crawler/status`, { timeout: 5000 });
+    return {
+      driverRunning: true,
+      message: '驱动器运行中',
+    };
+  } catch {
+    return {
+      driverRunning: false,
+      message: '驱动器未运行',
+    };
+  }
+}
+
+function buildEnhancedModeStatus() {
+  const cookieStatus = getAdminCookieStatus();
+  return getMediaCrawlerSnapshot().then((crawler) => {
+    const enhancedModeAvailable = crawler.driverRunning && cookieStatus.present && cookieStatus.validFormat && cookieStatus.verified;
+    return {
+      crawler,
+      cookieStatus,
+      data: {
+        mode: 'SHARED_COOKIE',
+        canSelfLogin: true,
+        driverRunning: crawler.driverRunning,
+        loginValid: enhancedModeAvailable,
+        enhancedModeAvailable,
+        loginMessage: enhancedModeAvailable ? ENHANCED_MODE_READY_MESSAGE : ENHANCED_MODE_MAINTENANCE_MESSAGE,
+        hint: enhancedModeAvailable ? null : '请在右上角启用增强模式并提交 Cookie，或等待驱动器恢复',
+        cookieConfigured: cookieStatus.present,
+        cookieValidFormat: cookieStatus.validFormat,
+        cookieVerified: cookieStatus.verified,
+        cookieUpdatedAt: cookieStatus.updatedAt,
+        cookieValidatedAt: cookieStatus.validatedAt,
+        cookieAccount: cookieStatus.account,
+      },
+    };
+  });
+}
+
+function clearEnhancedRuntimeState() {
+  clearAdminCookie();
+  xhsService.clearRuntimeCaches();
+}
+
 function runRuntimeCleanup(reason: string) {
   try {
     xhsService.cleanupRuntimeDataRetention(reason);
@@ -166,116 +404,43 @@ app.get('/api/health', (req: Request, res: Response) => {
 
 // 检查登录状态
 app.get('/api/login-status', async (req: Request, res: Response) => {
-  try {
-    const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
-
-    // 检查 MediaCrawler 是否运行
-    await axios.get(`${MEDIACRAWLER_API}/api/crawler/status`, { timeout: 5000 });
-
-    // 统一登录态检测（兼容新旧版 Chromium 的 Cookies 路径）
-    const state = detectLoginState();
-
-    res.json({
-      success: true,
-      data: {
-        mediaCrawlerRunning: true,
-        loginValid: state.valid,
-        loginMessage: state.message,
-        hint: state.valid ? null : '点击「扫码登录」按钮进行登录'
-      }
-    });
-  } catch (error: any) {
-    res.json({
-      success: false,
-      data: {
-        mediaCrawlerRunning: false,
-        loginValid: false,
-        loginMessage: 'MediaCrawler 服务未运行',
-        hint: '请启动 MediaCrawler 服务'
-      }
-    });
-  }
+  const status = await buildEnhancedModeStatus();
+  res.json({ success: true, data: status.data });
 });
 
-// 触发登录（启动带界面的爬虫）
-app.post('/api/login', async (req: Request, res: Response) => {
+app.post('/api/enhanced-cookie', async (req: Request, res: Response) => {
   try {
-    const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
-
-    // 启动一个带界面的搜索任务来触发登录
-    const response = await axios.post(`${MEDIACRAWLER_API}/api/crawler/start`, {
-      platform: 'xhs',
-      login_type: 'qrcode',  // 使用二维码登录
-      crawler_type: 'search',
-      keywords: 'test',
-      enable_comments: false,
-      save_option: 'json',
-      headless: false  // 显示浏览器界面
-    }, { timeout: 30000 });
-
+    const verified = await verifyXhsCookie(req.body?.cookie);
+    saveAdminCookie(verified.cookie, verified.account);
+    xhsService.clearRuntimeCaches();
+    const status = await buildEnhancedModeStatus();
     res.json({
       success: true,
-      message: '请在弹出的浏览器窗口中扫码登录',
-      hint: '登录成功后，关闭浏览器窗口即可'
+      message: verified.account?.nickname
+        ? `Cookie 校验通过：${verified.account.nickname}`
+        : 'Cookie 已通过实效校验',
+      data: status.data,
     });
   } catch (error: any) {
-    console.error('[API] 登录启动错误:', error.message);
-    res.status(500).json({
-      success: false,
-      message: '启动登录失败: ' + error.message,
-      hint: '请手动在终端运行: cd MediaCrawler && python main.py --platform xhs --lt qrcode --type search --keywords test --headless false'
-    });
-  }
-});
-
-// 退出登录：清理 MediaCrawler 浏览器数据里的 Cookies 文件，下次再用需要重新扫码
-//   - 先停掉可能还在跑的 crawler 子进程，避免 Windows 上 Cookies 文件被占用
-//   - 删除 Cookies 及其 SQLite 伴随文件（-journal/-wal/-shm），保留 browser_data 其他配置
-app.post('/api/logout', async (req: Request, res: Response) => {
-  console.log('[API] 退出登录请求');
-  // 1. 停止可能占用 Cookies 文件的 crawler 进程
-  try {
-    await xhsService.stopCrawler();
-  } catch (err: any) {
-    console.warn(`[API] 退出登录时 stopCrawler 异常（已忽略）: ${err.message}`);
-  }
-
-  // 2. 定位并删除 Cookies 文件（及 SQLite 伴随文件）
-  const state = detectLoginState();
-  if (!state.cookiesFile) {
-    return res.json({ success: true, message: '当前无登录状态，无需退出' });
-  }
-  const base = state.cookiesFile;
-  const targets = [base, `${base}-journal`, `${base}-wal`, `${base}-shm`];
-  const removed: string[] = [];
-  const failed: { path: string; err: string }[] = [];
-  for (const p of targets) {
-    if (!fs.existsSync(p)) continue;
-    try {
-      fs.unlinkSync(p);
-      removed.push(path.basename(p));
-    } catch (err: any) {
-      // Windows 文件占用时降级为清空内容，让 detectLoginState 判定为无效
-      try {
-        fs.truncateSync(p, 0);
-        removed.push(path.basename(p) + '(truncated)');
-      } catch (err2: any) {
-        failed.push({ path: p, err: err2.message || err.message });
-      }
+    clearEnhancedRuntimeState();
+    if (error instanceof AdminCookieValidationError) {
+      return res.status(400).json({ success: false, message: error.message });
     }
+    if (error instanceof XhsCookieVerificationError) {
+      return res.status(error.statusCode).json({ success: false, message: error.message });
+    }
+    res.status(500).json({ success: false, message: '保存 Cookie 失败' });
   }
+});
 
-  if (failed.length > 0) {
-    console.error('[API] 退出登录部分失败:', failed);
-    return res.status(500).json({
-      success: false,
-      message: '退出失败，文件可能被占用：' + failed.map(f => path.basename(f.path)).join(', '),
-      hint: '请先关闭残留的浏览器窗口后重试'
-    });
-  }
-
-  console.log(`[API] 退出登录完成，已清理: ${removed.join(', ')}`);
-  res.json({ success: true, message: '已退出登录', removed });
+app.post('/api/enhanced-cookie/clear', async (req: Request, res: Response) => {
+  clearEnhancedRuntimeState();
+  const status = await buildEnhancedModeStatus();
+  res.json({
+    success: true,
+    message: 'Cookie 已清除',
+    data: status.data,
+  });
 });
 
 // 取消当前任务：不仅序号 +1，还要真正通知 MediaCrawler 停止子进程
@@ -344,20 +509,40 @@ app.get('/api/progress', async (req: Request, res: Response) => {
     const key = String(req.query.key || '');
     const sinceRaw = Number(req.query.since);
     const sinceMs = Number.isFinite(sinceRaw) && sinceRaw > 0 ? sinceRaw : undefined;
+    const targetRaw = Number(req.query.target);
+    const targetCount = Number.isFinite(targetRaw) && targetRaw > 0 ? targetRaw : undefined;
     const progress = await xhsService.getLiveProgress(mode, key, sinceMs);
     res.json({
       success: true,
       data: {
         mode,
         key,
+        targetCount,
         count: progress.count,
+        parsedCount: progress.parsedCount,
+        discoveredCount: progress.discoveredCount,
+        detailTaskCount: progress.detailTaskCount,
         status: progress.status,
         taskId: currentTaskId,
       },
     });
   } catch (error: any) {
     // progress 接口不应该因为后端细节出错而让轮询断掉
-    res.json({ success: true, data: { count: 0, status: 'unknown', taskId: currentTaskId } });
+    res.json({ success: true, data: { count: 0, parsedCount: 0, discoveredCount: 0, detailTaskCount: 0, status: 'unknown', taskId: currentTaskId } });
+  }
+});
+
+app.post('/api/enrich-note', async (req: Request, res: Response) => {
+  try {
+    const { note } = req.body || {};
+    if (!note || typeof note !== 'object') {
+      return res.status(400).json({ success: false, message: '请提供需要补全的笔记' });
+    }
+
+    const enriched = await xhsService.enrichNoteMedia(note);
+    res.json({ success: true, data: enriched });
+  } catch (error: any) {
+    res.status(500).json({ success: false, message: error.message || '补全媒体信息失败' });
   }
 });
 
@@ -535,7 +720,85 @@ app.get('/api/download', async (req: Request, res: Response) => {
   }
 });
 
-// 批量下载 - 打包成ZIP
+// 创建批量下载任务：后台补全媒体信息，前端轮询进度后用浏览器原生下载 ZIP
+app.post('/api/download-jobs', async (req: Request, res: Response) => {
+  try {
+    const { notes } = req.body;
+
+    if (!notes || !Array.isArray(notes)) {
+      return res.status(400).json({ success: false, message: '请提供笔记列表' });
+    }
+
+    if (notes.length === 0) {
+      return res.status(400).json({ success: false, message: '请选择要下载的笔记' });
+    }
+
+    if (notes.length > MAX_ZIP_ITEMS) {
+      return res.status(413).json({
+        success: false,
+        message: `一次最多提交 ${MAX_ZIP_ITEMS} 条笔记，请减少选择数量或调整 MAX_ZIP_ITEMS`,
+      });
+    }
+
+    const job = downloadJobs.create(notes as NoteInfo[]);
+    console.log(`[API] 创建打包任务: jobId=${job.jobId}, notes=${notes.length}`);
+    void prepareDownloadJob(job.jobId);
+
+    res.status(202).json({
+      success: true,
+      data: buildDownloadJobPayload(job.jobId),
+    });
+  } catch (error: any) {
+    console.error('[API] 创建打包任务错误:', error.message);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+app.get('/api/download-jobs/:jobId/progress', async (req: Request, res: Response) => {
+  const jobId = getSingleParam(req.params.jobId);
+  if (!DOWNLOAD_JOB_ID_PATTERN.test(jobId)) {
+    return res.status(400).json({ success: false, message: '下载任务 ID 无效' });
+  }
+
+  const payload = buildDownloadJobPayload(jobId);
+  if (!payload) {
+    return res.status(404).json({ success: false, message: '下载任务不存在或已过期' });
+  }
+
+  res.json({ success: true, data: payload });
+});
+
+app.get('/api/download-jobs/:jobId/file', async (req: Request, res: Response) => {
+  const jobId = getSingleParam(req.params.jobId);
+  if (!DOWNLOAD_JOB_ID_PATTERN.test(jobId)) {
+    return res.status(400).json({ success: false, message: '下载任务 ID 无效' });
+  }
+
+  const job = downloadJobs.get(jobId);
+  if (!job) {
+    return res.status(404).json({ success: false, message: '下载任务不存在或已过期' });
+  }
+  if (job.status === 'failed') {
+    return res.status(409).json({ success: false, message: job.message || '下载任务失败' });
+  }
+  if (job.status !== 'ready' || !job.downloadItems?.length) {
+    return res.status(409).json({ success: false, message: '下载任务尚未准备完成' });
+  }
+
+  try {
+    downloadJobs.markDownloading(jobId);
+    await streamZipDownloadItems(job.downloadItems, res, { jobId });
+    downloadJobs.markCompleted(jobId);
+  } catch (error: any) {
+    downloadJobs.markFailed(jobId, error);
+    console.error('[API] 任务打包错误:', error.message);
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: error.message });
+    }
+  }
+});
+
+// 批量下载 - 打包成 ZIP（旧接口保留，兼容单帖图片/实况组件下载）
 app.post('/api/download-zip', async (req: Request, res: Response) => {
   try {
     const { notes } = req.body;
@@ -545,52 +808,8 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
     }
 
     console.log(`[API] 打包下载: ${notes.length} 个笔记`);
-
-    // 收集所有下载URL（同时过滤白名单外的链接）
-    const downloadItems: { url: string; filename: string; fallbackUrls?: string[] }[] = [];
-    const usedFilenames = new Set<string>();
-    for (const note of notes) {
-      const noteId = sanitizeFileSegment(note?.noteId, 'note');
-      if (note.type === 'video' && note.video?.url && isAllowedProxyUrl(note.video.url)) {
-        const filename = createUniqueFilename(`${noteId}_video.mp4`, usedFilenames);
-        downloadItems.push({
-          url: note.video.url,
-          filename,
-          fallbackUrls: Array.isArray(note.video.backupUrls) ? note.video.backupUrls : undefined
-        });
-      } else if (note.images && note.images.length > 0) {
-        const livePhotoImageIndexes = new Set<number>();
-        if (Array.isArray(note.livePhotos) && note.livePhotos.length > 0) {
-          note.livePhotos.forEach((item: any, idx: number) => {
-            const liveIndex = Number.isInteger(item?.index) ? Number(item.index) : idx;
-            if (isAllowedProxyUrl(item?.imageUrl)) {
-              livePhotoImageIndexes.add(liveIndex);
-              downloadItems.push({
-                url: item.imageUrl,
-                filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.jpg`, usedFilenames)
-              });
-            }
-            if (isAllowedProxyUrl(item?.videoUrl)) {
-              downloadItems.push({
-                url: item.videoUrl,
-                filename: createUniqueFilename(`${noteId}_live${liveIndex + 1}.mp4`, usedFilenames),
-                fallbackUrls: Array.isArray(item?.videoUrls) ? item.videoUrls.filter((url: string) => url !== item.videoUrl) : undefined
-              });
-            }
-          });
-        }
-
-        note.images.forEach((img: string, idx: number) => {
-          if (!livePhotoImageIndexes.has(idx) && isAllowedProxyUrl(img)) {
-            const filename = createUniqueFilename(`${noteId}_img${idx + 1}.jpg`, usedFilenames);
-            downloadItems.push({
-              url: img,
-              filename
-            });
-          }
-        });
-      }
-    }
+    const enrichedNotes = await xhsService.enrichNotesMedia(notes, MEDIA_ENRICH_CONCURRENCY);
+    const downloadItems = collectDownloadItems(enrichedNotes);
 
     if (downloadItems.length === 0) {
       return res.status(400).json({ success: false, message: '没有可下载的内容' });
@@ -603,69 +822,13 @@ app.post('/api/download-zip', async (req: Request, res: Response) => {
       });
     }
 
-    // 设置响应头
-    res.setHeader('Content-Type', 'application/zip');
-    res.setHeader('Content-Disposition', `attachment; filename="xiaohongshu_${Date.now()}.zip"`);
-
-    // 创建zip流
-    const archive = archiver('zip', { zlib: { level: 9 } });
-    archive.on('warning', (err) => {
-      console.warn(`[打包] ZIP 警告: ${err.message}`);
-    });
-    archive.on('error', (err) => {
-      console.error(`[打包] ZIP 错误: ${err.message}`);
-      if (!res.destroyed) res.destroy(err);
-    });
-    archive.pipe(res);
-
-    // 低内存流式打包：逐个拉取文件并直接写入 zip，避免把所有文件 buffer 堆在内存里。
-    const failedItems: string[] = [];
-    for (const item of downloadItems) {
-      const candidateUrls = Array.from(new Set([
-        item.url,
-        ...(item.fallbackUrls || []),
-      ])).filter(isAllowedProxyUrl);
-      let added = false;
-      let lastError = '';
-
-      for (const candidateUrl of candidateUrls) {
-        if (added) break;
-        try {
-          const response = await axios.get(candidateUrl, {
-            responseType: 'stream',
-            headers: {
-              'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-              'Referer': 'https://www.xiaohongshu.com/',
-            },
-            timeout: 30000
-          });
-          archive.append(response.data, { name: item.filename });
-          await waitForReadableEnd(response.data);
-          console.log(`[打包] 流式添加: ${item.filename}`);
-          added = true;
-        } catch (err: any) {
-          lastError = err.message;
-          console.error(`[打包] 失败: ${item.filename} - ${err.message}`);
-        }
-      }
-
-      if (!added) {
-        failedItems.push(`${item.filename}: ${lastError || '所有备用地址均不可用'}`);
-      }
-    }
-
-    if (failedItems.length > 0) {
-      archive.append(
-        `以下文件下载失败，已跳过：\n${failedItems.join('\n')}\n`,
-        { name: '_download_errors.txt' }
-      );
-    }
-
-    await archive.finalize();
+    await streamZipDownloadItems(downloadItems, res);
 
   } catch (error: any) {
     console.error('[API] 打包错误:', error.message);
-    res.status(500).json({ success: false, message: error.message });
+    if (!res.headersSent) {
+      res.status(500).json({ success: false, message: error.message });
+    }
   }
 });
 
@@ -680,7 +843,7 @@ const FRONTEND_DIST = process.env.FRONTEND_DIST
 if (fs.existsSync(FRONTEND_DIST)) {
   app.use(express.static(FRONTEND_DIST, { maxAge: '1h', index: false }));
   app.use((req: Request, res: Response, next) => {
-    if (req.method !== 'GET') return next();
+    if (req.method !== 'GET' && req.method !== 'HEAD') return next();
     if (req.path.startsWith('/api/')) return next();
     res.sendFile(path.join(FRONTEND_DIST, 'index.html'), (err: any) => {
       if (err) next(err);

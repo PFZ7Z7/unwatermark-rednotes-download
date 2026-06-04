@@ -38,10 +38,23 @@ interface NoteInfo {
 }
 
 interface LoginStatus {
-  mediaCrawlerRunning: boolean;
+  driverRunning: boolean;
   loginValid: boolean;
   loginMessage: string;
   hint?: string | null;
+  mode?: 'SHARED_COOKIE';
+  canSelfLogin?: boolean;
+  enhancedModeAvailable?: boolean;
+  cookieConfigured?: boolean;
+  cookieValidFormat?: boolean;
+  cookieVerified?: boolean;
+  cookieUpdatedAt?: string;
+  cookieValidatedAt?: string;
+  cookieAccount?: {
+    nickname?: string;
+    avatar?: string;
+    userId?: string;
+  };
 }
 
 type Mode = 'parse' | 'search' | 'creator';
@@ -57,14 +70,34 @@ const TARGET_COUNT_OPTIONS = [20, 40, 60, 80, 100] as const;
 
 interface ProgressInfo {
   count: number;
+  parsedCount: number;
+  discoveredCount: number;
+  detailTaskCount: number;
   status: 'running' | 'idle' | 'error' | 'unknown';
   elapsedMs: number;
+}
+
+type DownloadJobStatus = 'queued' | 'enriching' | 'ready' | 'downloading' | 'completed' | 'failed';
+
+interface DownloadJobProgress {
+  jobId: string;
+  status: DownloadJobStatus;
+  totalNotes: number;
+  enrichedNotes: number;
+  totalFiles: number;
+  zippedFiles: number;
+  downloadedBytes: number;
+  message: string;
+  progressUrl: string;
+  downloadUrl: string;
 }
 
 type Notice = {
   type: 'success' | 'error' | 'info';
   message: string;
 };
+
+type EnhancedCookieAction = 'save' | 'clear' | null;
 
 type ErrorTone = 'error' | 'warning' | 'login';
 
@@ -97,13 +130,29 @@ const formatPublishTime = (timestamp?: number): string => {
 const stripTopicMarkers = (desc: string, hasStructuredTags: boolean): string =>
   hasStructuredTags ? desc.replace(TOPIC_PATTERN, '').replace(/\s{2,}/g, ' ').trim() : desc;
 
+const getNoteKey = (note: Pick<NoteInfo, 'noteId' | 'noteUrl'>): string =>
+  note.noteId || note.noteUrl || '';
+
+const formatBytes = (bytes: number): string => {
+  if (!Number.isFinite(bytes) || bytes <= 0) return '0 B';
+  const units = ['B', 'KB', 'MB', 'GB'];
+  let value = bytes;
+  let index = 0;
+  while (value >= 1024 && index < units.length - 1) {
+    value /= 1024;
+    index += 1;
+  }
+  const digits = index === 0 ? 0 : 1;
+  return `${value.toFixed(digits)} ${units[index]}`;
+};
+
 const classifyErrorMessage = (message: string, needsLogin: boolean): ErrorSummary => {
   const lower = message.toLowerCase();
 
   if (needsLogin) {
     return {
       tone: 'login',
-      title: '增强模式需要登录',
+      title: '增强模式维护中',
       message,
       showLoginAction: true,
     };
@@ -153,7 +202,7 @@ const classifyErrorMessage = (message: string, needsLogin: boolean): ErrorSummar
   };
 };
 
-function App() {
+function PublicApp({ apiBase }: { apiBase: string }) {
   const [mode, setMode] = useState<Mode>('parse');
   const [url, setUrl] = useState('');
   const [keywords, setKeywords] = useState('');
@@ -165,11 +214,15 @@ function App() {
   const [notice, setNotice] = useState<Notice | null>(null);
   const [noteInfo, setNoteInfo] = useState<NoteInfo | null>(null);
   const [noteList, setNoteList] = useState<NoteInfo[]>([]);
+  const [previewIndexes, setPreviewIndexes] = useState<Record<string, number>>({});
+  const [enrichingNoteIds, setEnrichingNoteIds] = useState<Set<string>>(new Set());
+  const [batchProgress, setBatchProgress] = useState<DownloadJobProgress | null>(null);
   const [selectedNotes, setSelectedNotes] = useState<Set<string>>(new Set());
   const [currentPage, setCurrentPage] = useState(1);
   const [loginStatus, setLoginStatus] = useState<LoginStatus | null>(null);
   const [showLoginModal, setShowLoginModal] = useState(false);
-  const [loginLoading, setLoginLoading] = useState(false);
+  const [enhancedCookie, setEnhancedCookie] = useState('');
+  const [enhancedCookieAction, setEnhancedCookieAction] = useState<EnhancedCookieAction>(null);
 
   // 进度相关状态
   const [targetCount, setTargetCount] = useState<number>(20);
@@ -178,14 +231,21 @@ function App() {
   const [lastSearchTarget, setLastSearchTarget] = useState<number>(0);
   const progressTimerRef = useRef<number | null>(null);
   const noticeTimerRef = useRef<number | null>(null);
-  const loginPollTimerRef = useRef<number | null>(null);
+  const batchProgressTimerRef = useRef<number | null>(null);
   const requestInFlightRef = useRef(false);
+  const enrichPromisesRef = useRef<Map<string, Promise<NoteInfo>>>(new Map());
   const searchStartTsRef = useRef<number>(0);
 
   // 优先用环境变量（开发态推荐设为 http://localhost:3001 连本地后端）；
   // 生产部署推荐不设该变量、走同源空字符串 + Nginx 将 /api 反代到后端。
   // 这样 build 产物不依赖部署环境的后端域名，一份镜像在多环境可重用。
-  const API_BASE = import.meta.env.VITE_API_URL ?? '';
+  const API_BASE = apiBase;
+
+  const handleModeChange = useCallback((nextMode: Mode) => {
+    setMode(nextMode);
+    setError('');
+    setErrorNeedsLogin(false);
+  }, []);
 
   // 获取代理URL - 解决小红书资源需要特定请求头的问题
   const getProxyUrl = useCallback((url: string, type: 'video' | 'image' = 'image'): string => {
@@ -217,12 +277,61 @@ function App() {
       }
     } catch {
       setLoginStatus({
-        mediaCrawlerRunning: false,
+        driverRunning: false,
         loginValid: false,
         loginMessage: '服务连接失败'
       });
     }
   }, [API_BASE]);
+
+  const handleSaveEnhancedCookie = useCallback(async () => {
+    const cookie = enhancedCookie.trim();
+    if (!cookie) {
+      showNotice('error', '请先粘贴 Cookie');
+      return;
+    }
+
+    setEnhancedCookieAction('save');
+    try {
+      const response = await fetch(`${API_BASE}/api/enhanced-cookie`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ cookie }),
+      });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.success || !payload?.data) {
+        throw new Error(payload?.message || '保存 Cookie 失败');
+      }
+      setLoginStatus(payload.data);
+      setEnhancedCookie('');
+      showNotice('success', payload.message || 'Cookie 已保存');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '保存 Cookie 失败';
+      showNotice('error', message);
+      checkLoginStatus();
+    } finally {
+      setEnhancedCookieAction(null);
+    }
+  }, [API_BASE, checkLoginStatus, enhancedCookie, showNotice]);
+
+  const handleClearEnhancedCookie = useCallback(async () => {
+    setEnhancedCookieAction('clear');
+    try {
+      const response = await fetch(`${API_BASE}/api/enhanced-cookie/clear`, { method: 'POST' });
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.success || !payload?.data) {
+        throw new Error(payload?.message || '清除 Cookie 失败');
+      }
+      setLoginStatus(payload.data);
+      setEnhancedCookie('');
+      showNotice('success', payload.message || 'Cookie 已清除');
+    } catch (err) {
+      const message = err instanceof Error ? err.message : '清除 Cookie 失败';
+      showNotice('error', message);
+    } finally {
+      setEnhancedCookieAction(null);
+    }
+  }, [API_BASE, showNotice]);
 
   // 初始化时检查登录状态
   useEffect(() => {
@@ -238,7 +347,6 @@ function App() {
   useEffect(() => {
     return () => {
       if (noticeTimerRef.current !== null) window.clearTimeout(noticeTimerRef.current);
-      if (loginPollTimerRef.current !== null) window.clearInterval(loginPollTimerRef.current);
     };
   }, []);
 
@@ -250,76 +358,6 @@ function App() {
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [showLoginModal]);
-
-  // 触发登录
-  const handleLogin = async () => {
-    setLoginLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/api/login`, { method: 'POST' });
-      const data = await response.json();
-      if (data.success) {
-        showNotice('info', data.message || '请在弹出的浏览器窗口中扫码登录');
-        // 登录期间高频轮询：每 3 秒试一次，最长 2 分钟；成功即止
-        let tries = 0;
-        if (loginPollTimerRef.current !== null) {
-          window.clearInterval(loginPollTimerRef.current);
-        }
-        loginPollTimerRef.current = window.setInterval(async () => {
-          tries++;
-          try {
-            const r = await fetch(`${API_BASE}/api/login-status`);
-            const j = await r.json();
-            if (j.success && j.data?.loginValid) {
-              setLoginStatus(j.data);
-              setShowLoginModal(false);
-              showNotice('success', '登录成功，可以使用搜索和博主模式了');
-              if (loginPollTimerRef.current !== null) {
-                window.clearInterval(loginPollTimerRef.current);
-                loginPollTimerRef.current = null;
-              }
-              return;
-            }
-            if (j.data) setLoginStatus(j.data);
-          } catch {
-            // 登录轮询失败不阻断用户继续扫码。
-          }
-          if (tries >= 40 && loginPollTimerRef.current !== null) {
-            window.clearInterval(loginPollTimerRef.current);
-            loginPollTimerRef.current = null;
-          }
-        }, 3000);
-      } else {
-        showNotice('error', [data.message, data.hint].filter(Boolean).join('：'));
-      }
-    } catch {
-      showNotice('error', '启动增强模式失败，请检查本地服务是否正常');
-    } finally {
-      setLoginLoading(false);
-    }
-  };
-
-  // 退出登录：调用后端清掉 Cookies 文件后刷新状态
-  const handleLogout = async () => {
-    if (!window.confirm('确定要退出当前登录吗？\n退出后需要重新扫码才能使用搜索/博主模式。')) {
-      return;
-    }
-    setLoginLoading(true);
-    try {
-      const response = await fetch(`${API_BASE}/api/logout`, { method: 'POST' });
-      const data = await response.json();
-      if (data.success) {
-        showNotice('success', data.message || '已退出登录');
-        await checkLoginStatus();
-        setShowLoginModal(false);
-      } else {
-        showNotice('error', [data.message || '退出失败', data.hint].filter(Boolean).join('：'));
-      }
-    } catch {
-      showNotice('error', '退出登录请求失败，请检查后端服务是否正常');
-    } finally {
-      setLoginLoading(false);
-    }
-  };
 
   // 检查错误是否是登录相关
   // 优先信任后端明确的 needLogin 字段；其次按关键词兑底
@@ -359,6 +397,66 @@ function App() {
     }
   }, []);
 
+  const stopBatchProgressPolling = useCallback(() => {
+    if (batchProgressTimerRef.current !== null) {
+      window.clearInterval(batchProgressTimerRef.current);
+      batchProgressTimerRef.current = null;
+    }
+  }, []);
+
+  const triggerNativeDownload = useCallback((downloadUrl: string) => {
+    const link = document.createElement('a');
+    link.href = `${API_BASE}${downloadUrl}`;
+    link.rel = 'noopener';
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  }, [API_BASE]);
+
+  const startBatchProgressPolling = useCallback((initialProgress: DownloadJobProgress) => {
+    stopBatchProgressPolling();
+    setBatchProgress(initialProgress);
+    let nativeDownloadStarted = false;
+
+    const tick = async () => {
+      try {
+        const response = await fetch(`${API_BASE}${initialProgress.progressUrl}`);
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.success || !payload?.data) {
+          throw new Error(payload?.message || '下载任务进度查询失败');
+        }
+
+        const next = payload.data as DownloadJobProgress;
+        setBatchProgress(next);
+
+        if (next.status === 'ready' && !nativeDownloadStarted) {
+          nativeDownloadStarted = true;
+          triggerNativeDownload(next.downloadUrl);
+        }
+
+        if (next.status === 'completed') {
+          stopBatchProgressPolling();
+          setBatchDownloading(false);
+          showNotice('success', '批量下载已完成');
+        } else if (next.status === 'failed') {
+          stopBatchProgressPolling();
+          setBatchDownloading(false);
+          throw new Error(next.message || '批量下载失败');
+        }
+      } catch (err) {
+        stopBatchProgressPolling();
+        setBatchDownloading(false);
+        const message = err instanceof Error ? err.message : '批量下载失败';
+        setError(message);
+        setErrorNeedsLogin(false);
+        showNotice('error', message);
+      }
+    };
+
+    tick();
+    batchProgressTimerRef.current = window.setInterval(tick, PROGRESS_POLL_INTERVAL_MS);
+  }, [API_BASE, showNotice, stopBatchProgressPolling, triggerNativeDownload]);
+
   // 启动进度轮询
   const startProgressPolling = useCallback((
     mode: 'search' | 'creator',
@@ -368,17 +466,21 @@ function App() {
     // since 减 5s 缓冲区，跟后端 searchStartTs 的库存策略对齐
     const sinceMs = Date.now() - 5000;
     searchStartTsRef.current = Date.now();
-    setProgress({ count: 0, status: 'running', elapsedMs: 0 });
+    setProgress({ count: 0, parsedCount: 0, discoveredCount: 0, detailTaskCount: 0, status: 'running', elapsedMs: 0 });
 
     const tick = async () => {
       try {
-        const qs = new URLSearchParams({ mode, key, since: String(sinceMs) }).toString();
+        const qs = new URLSearchParams({ mode, key, since: String(sinceMs), target: String(targetCount) }).toString();
         const r = await fetch(`${API_BASE}/api/progress?${qs}`);
         const j = await r.json();
         if (j?.success) {
           const elapsedMs = Date.now() - searchStartTsRef.current;
+          const parsedCount = Number(j.data?.parsedCount ?? j.data?.count) || 0;
           setProgress({
-            count: Number(j.data?.count) || 0,
+            count: parsedCount,
+            parsedCount,
+            discoveredCount: Number(j.data?.discoveredCount) || parsedCount,
+            detailTaskCount: Number(j.data?.detailTaskCount) || 0,
             status: j.data?.status || 'unknown',
             elapsedMs,
           });
@@ -389,7 +491,7 @@ function App() {
     };
     tick();
     progressTimerRef.current = window.setInterval(tick, PROGRESS_POLL_INTERVAL_MS);
-  }, [API_BASE, stopProgressPolling]);
+  }, [API_BASE, stopProgressPolling, targetCount]);
 
   // 提前结束（将已爬到的部分结果正常返回）
   const handleFinishEarly = useCallback(async () => {
@@ -402,8 +504,11 @@ function App() {
 
   // 组件卸载时清理定时器
   useEffect(() => {
-    return () => stopProgressPolling();
-  }, [stopProgressPolling]);
+    return () => {
+      stopProgressPolling();
+      stopBatchProgressPolling();
+    };
+  }, [stopBatchProgressPolling, stopProgressPolling]);
 
   // 解析单个笔记
   const handleParse = useCallback(async () => {
@@ -421,6 +526,8 @@ function App() {
     setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
+    setPreviewIndexes({});
+    setEnrichingNoteIds(new Set());
     setSelectedNotes(new Set());
     setCurrentPage(1);
 
@@ -459,6 +566,13 @@ function App() {
       setErrorNeedsLogin(false);
       return;
     }
+    if (!loginStatus?.loginValid) {
+      setError('请先在右上角启用增强模式后再使用关键词搜索');
+      setErrorNeedsLogin(true);
+      setShowLoginModal(true);
+      checkLoginStatus();
+      return;
+    }
 
     requestInFlightRef.current = true;
     setLoading(true);
@@ -466,6 +580,8 @@ function App() {
     setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
+    setPreviewIndexes({});
+    setEnrichingNoteIds(new Set());
     setSelectedNotes(new Set());
     setCurrentPage(1);
     setLastSearchTarget(targetCount);
@@ -502,7 +618,7 @@ function App() {
       setProgress(null);
       setLoading(false);
     }
-  }, [keywords, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError]);
+  }, [keywords, loginStatus?.loginValid, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError, checkLoginStatus]);
 
   // 获取博主笔记
   const handleCreator = useCallback(async () => {
@@ -513,6 +629,13 @@ function App() {
       setErrorNeedsLogin(false);
       return;
     }
+    if (!loginStatus?.loginValid) {
+      setError('请先在右上角启用增强模式后再获取博主笔记');
+      setErrorNeedsLogin(true);
+      setShowLoginModal(true);
+      checkLoginStatus();
+      return;
+    }
 
     requestInFlightRef.current = true;
     setLoading(true);
@@ -520,6 +643,8 @@ function App() {
     setErrorNeedsLogin(false);
     setNoteInfo(null);
     setNoteList([]);
+    setPreviewIndexes({});
+    setEnrichingNoteIds(new Set());
     setSelectedNotes(new Set());
     setCurrentPage(1);
     setLastSearchTarget(targetCount);
@@ -558,7 +683,7 @@ function App() {
       setProgress(null);
       setLoading(false);
     }
-  }, [url, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError]);
+  }, [url, loginStatus?.loginValid, targetCount, API_BASE, startProgressPolling, stopProgressPolling, checkLoginError, checkLoginStatus]);
 
   const handleDownload = useCallback((downloadUrl: string, filename: string, fallbackUrls: string[] = []) => {
     const params = new URLSearchParams({ url: downloadUrl });
@@ -574,23 +699,85 @@ function App() {
     link.remove();
   }, [API_BASE]);
 
-  const handleDownloadNoteImages = useCallback(async (note: NoteInfo) => {
-    const livePhotoCount = note.livePhotos?.length || 0;
-    if (livePhotoCount === 0 && note.images.length <= 1) {
-      if (note.images[0]) {
-        handleDownload(note.images[0], `image_${note.noteId}_1.jpg`);
-      }
-      return;
-    }
+  const updateNoteInState = useCallback((nextNote: NoteInfo) => {
+    const key = getNoteKey(nextNote);
+    if (!key) return;
 
+    setNoteList(prev => prev.map(item => getNoteKey(item) === key ? nextNote : item));
+    setNoteInfo(prev => prev && getNoteKey(prev) === key ? nextNote : prev);
+  }, []);
+
+  const ensureNoteMedia = useCallback(async (note: NoteInfo, options: { silent?: boolean } = {}): Promise<NoteInfo> => {
+    const key = getNoteKey(note);
+    if (!key || note.parseMode === 'anonymous') return note;
+
+    const existing = enrichPromisesRef.current.get(key);
+    if (existing) return existing;
+
+    setEnrichingNoteIds(prev => new Set(prev).add(key));
+    const promise = fetch(`${API_BASE}/api/enrich-note`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ note }),
+    })
+      .then(async response => {
+        const payload = await response.json().catch(() => null);
+        if (!response.ok || !payload?.success || !payload?.data) {
+          throw new Error(payload?.message || '补全媒体信息失败');
+        }
+        const enriched = payload.data as NoteInfo;
+        updateNoteInState(enriched);
+        return enriched;
+      })
+      .catch(err => {
+        if (!options.silent) {
+          const message = err instanceof Error ? err.message : '补全媒体信息失败';
+          showNotice('error', message);
+        }
+        return note;
+      })
+      .finally(() => {
+        enrichPromisesRef.current.delete(key);
+        setEnrichingNoteIds(prev => {
+          const next = new Set(prev);
+          next.delete(key);
+          return next;
+        });
+      });
+
+    enrichPromisesRef.current.set(key, promise);
+    return promise;
+  }, [API_BASE, showNotice, updateNoteInState]);
+
+  const handleDownloadNoteMedia = useCallback(async (note: NoteInfo) => {
     setNoteDownloading(true);
     setError('');
     setErrorNeedsLogin(false);
     try {
+      if (note.parseMode !== 'anonymous') {
+        showNotice('info', '正在补全媒体信息');
+      }
+      const enriched = await ensureNoteMedia(note);
+
+      if (enriched.type === 'video' && enriched.video?.url) {
+        handleDownload(enriched.video.url, `video_${enriched.noteId}.mp4`, enriched.video.backupUrls || []);
+        showNotice('success', '已开始下载视频');
+        return;
+      }
+
+      const livePhotoCount = enriched.livePhotos?.length || 0;
+      if (livePhotoCount === 0 && enriched.images.length <= 1) {
+        if (enriched.images[0]) {
+          handleDownload(enriched.images[0], `image_${enriched.noteId}_1.jpg`);
+          showNotice('success', '已开始下载图片');
+        }
+        return;
+      }
+
       const response = await fetch(`${API_BASE}/api/download-zip`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ notes: [note] }),
+        body: JSON.stringify({ notes: [enriched] }),
       });
 
       if (!response.ok) {
@@ -602,7 +789,7 @@ function App() {
       const downloadUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
       link.href = downloadUrl;
-      link.download = `xiaohongshu_${note.noteId || Date.now()}.zip`;
+      link.download = `xiaohongshu_${enriched.noteId || Date.now()}.zip`;
       link.rel = 'noopener';
       document.body.appendChild(link);
       link.click();
@@ -610,7 +797,7 @@ function App() {
       window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
       showNotice('success', livePhotoCount > 0
         ? `已开始打包下载 ${livePhotoCount} 组实况组件`
-        : `已开始打包下载 ${note.images.length} 张图片`);
+        : `已开始打包下载 ${enriched.images.length} 张图片`);
     } catch (err) {
       const message = err instanceof Error ? err.message : '打包下载失败';
       setError(message);
@@ -619,7 +806,25 @@ function App() {
     } finally {
       setNoteDownloading(false);
     }
-  }, [API_BASE, handleDownload, showNotice]);
+  }, [API_BASE, ensureNoteMedia, handleDownload, showNotice]);
+
+  const handlePreviewStep = useCallback((note: NoteInfo, delta: number) => {
+    const key = getNoteKey(note);
+    const total = Math.max(1, note.images.length);
+    if (!key || total <= 1) return;
+
+    ensureNoteMedia(note, { silent: true });
+    setPreviewIndexes(prev => {
+      const current = Math.min(prev[key] || 0, total - 1);
+      return { ...prev, [key]: (current + delta + total) % total };
+    });
+  }, [ensureNoteMedia]);
+
+  const handleOpenNoteDetail = useCallback(async (note: NoteInfo) => {
+    const enriched = await ensureNoteMedia(note, { silent: true });
+    setNoteInfo(enriched);
+    window.scrollTo({ top: 0, behavior: 'smooth' });
+  }, [ensureNoteMedia]);
 
   const handleCopyUrl = useCallback(async (noteUrl: string) => {
     try {
@@ -676,37 +881,28 @@ function App() {
     }
 
     setBatchDownloading(true);
+    setBatchProgress(null);
     setError('');
     setErrorNeedsLogin(false);
     try {
-      const response = await fetch(`${API_BASE}/api/download-zip`, {
+      const response = await fetch(`${API_BASE}/api/download-jobs`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ notes: selectedList }),
       });
 
-      if (!response.ok) {
-        const payload = await response.json().catch(() => null);
+      const payload = await response.json().catch(() => null);
+      if (!response.ok || !payload?.success || !payload?.data) {
         throw new Error(payload?.message || '下载失败');
       }
 
-      const blob = await response.blob();
-      const downloadUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = downloadUrl;
-      link.download = `xiaohongshu_${Date.now()}.zip`;
-      link.rel = 'noopener';
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.setTimeout(() => window.URL.revokeObjectURL(downloadUrl), 0);
-      showNotice('success', `已开始打包下载 ${selectedList.length} 条笔记`);
+      startBatchProgressPolling(payload.data as DownloadJobProgress);
+      showNotice('info', `已创建打包任务，正在处理 ${selectedList.length} 条笔记`);
     } catch (err) {
       const message = err instanceof Error ? err.message : '批量下载失败';
       setError(message);
       setErrorNeedsLogin(false);
       showNotice('error', message);
-    } finally {
       setBatchDownloading(false);
     }
   };
@@ -734,13 +930,13 @@ function App() {
             type="button"
             className="login-status-indicator"
             onClick={() => setShowLoginModal(true)}
-            aria-label="查看增强模式登录状态"
+            aria-label="启用或查看增强模式状态"
           >
             {loginStatus ? (
               loginStatus.loginValid ? (
-                <span className="status-badge valid">✓ 增强模式已登录</span>
+                <span className="status-badge valid">✓ 增强模式已启用</span>
               ) : (
-                <span className="status-badge invalid">增强模式待登录</span>
+                <span className="status-badge invalid">启用增强模式</span>
               )
             ) : (
               <span className="status-badge checking">检查中...</span>
@@ -755,7 +951,7 @@ function App() {
         </div>
       )}
 
-      {/* 登录提示弹窗 */}
+      {/* 增强模式状态弹窗 */}
       {showLoginModal && (
         <div className="login-modal-overlay" onClick={() => setShowLoginModal(false)}>
           <div
@@ -765,43 +961,79 @@ function App() {
             aria-labelledby="login-modal-title"
             onClick={e => e.stopPropagation()}
           >
-            <h3 id="login-modal-title">🔐 增强模式登录状态</h3>
+            <h3 id="login-modal-title">启用增强模式</h3>
             <p className="login-mode-note">
-              普通分享链接解析通常无需登录；关键词搜索、博主笔记和登录解析会使用增强模式。
+              普通分享链接解析和下载默认可用；关键词搜索和博主笔记需要提交 Xiaohongshu Cookie 后使用。
             </p>
             {loginStatus ? (
-              <>
-                {!loginStatus.loginValid ? (
-                  <div className="login-actions">
-                    <button
-                      className="login-btn"
-                      onClick={handleLogin}
-                      disabled={loginLoading}
-                    >
-                      {loginLoading ? '启动中...' : '📱 扫码登录'}
-                    </button>
-                    <p className="login-tip">
-                      点击后将弹出浏览器窗口，请使用小红书 App 扫码登录增强模式
-                    </p>
-                  </div>
-                ) : (
-                  <div className="login-actions">
-                    <button
-                      className="logout-btn"
-                      onClick={handleLogout}
-                      disabled={loginLoading}
-                    >
-                      {loginLoading ? '处理中...' : '🚪 退出登录'}
-                    </button>
-                    <p className="login-tip">
-                      退出后将清除本地增强模式凭证，下次需要重新扫码
-                    </p>
+              <div className={`login-status-detail ${loginStatus.loginValid ? 'valid' : 'invalid'}`}>
+                <p className="login-status-title"><strong>{loginStatus.loginMessage}</strong></p>
+                <p className="login-status-line">
+                  驱动器：{loginStatus.driverRunning ? '运行中' : '未运行'}
+                </p>
+                <p className="login-status-line cookie-line">
+                  Cookie：
+                  {loginStatus.cookieConfigured
+                    ? (loginStatus.cookieVerified ? '已通过实效校验' : (loginStatus.cookieValidFormat ? '待重新校验' : '格式异常'))
+                    : '未配置'}
+                </p>
+                {loginStatus.cookieAccount && (
+                  <div className="login-account">
+                    {loginStatus.cookieAccount.avatar ? (
+                      <img
+                        src={loginStatus.cookieAccount.avatar}
+                        alt=""
+                        referrerPolicy="no-referrer"
+                      />
+                    ) : (
+                      <span className="login-account-avatar-fallback" aria-hidden="true">
+                        {(loginStatus.cookieAccount.nickname || '小').slice(0, 1)}
+                      </span>
+                    )}
+                    <div>
+                      <strong>{loginStatus.cookieAccount.nickname || '小红书用户'}</strong>
+                    </div>
                   </div>
                 )}
-              </>
+                {loginStatus.cookieUpdatedAt && (
+                  <p className="login-status-line">更新时间：{new Date(loginStatus.cookieUpdatedAt).toLocaleString('zh-CN')}</p>
+                )}
+                {loginStatus.cookieValidatedAt && (
+                  <p className="login-status-line">实效校验时间：{new Date(loginStatus.cookieValidatedAt).toLocaleString('zh-CN')}</p>
+                )}
+                {loginStatus.hint && <p className="hint">{loginStatus.hint}</p>}
+              </div>
             ) : (
-              <p>正在检查登录状态...</p>
+              <p>正在检查增强模式状态...</p>
             )}
+            <label className="enhanced-cookie-field">
+              <span>Cookie</span>
+              <textarea
+                value={enhancedCookie}
+                onChange={(e) => setEnhancedCookie(e.target.value)}
+                placeholder="粘贴浏览器请求里的 Cookie header，需包含 web_session"
+                spellCheck={false}
+              />
+            </label>
+            <div className="enhanced-cookie-actions">
+              <button
+                className="login-btn"
+                onClick={handleSaveEnhancedCookie}
+                disabled={enhancedCookieAction !== null}
+              >
+                {enhancedCookieAction === 'save' ? '校验中...' : '保存并校验'}
+              </button>
+              <button
+                className="logout-btn"
+                onClick={handleClearEnhancedCookie}
+                disabled={enhancedCookieAction !== null}
+              >
+                {enhancedCookieAction === 'clear' ? '清除中...' : '清除 Cookie'}
+              </button>
+            </div>
+            <button className="login-btn secondary" onClick={checkLoginStatus}>
+              刷新状态
+            </button>
             <button className="close-modal-btn" onClick={() => setShowLoginModal(false)}>
               关闭
             </button>
@@ -820,15 +1052,15 @@ function App() {
 
           {/* Mode Tabs */}
           <div className="mode-tabs">
-            <button className={`mode-tab ${mode === 'parse' ? 'active' : ''}`} onClick={() => setMode('parse')} aria-pressed={mode === 'parse'}>
+            <button className={`mode-tab ${mode === 'parse' ? 'active' : ''}`} onClick={() => handleModeChange('parse')} aria-pressed={mode === 'parse'}>
               📄 解析链接
             </button>
-            <button className={`mode-tab ${mode === 'creator' ? 'active' : ''}`} onClick={() => setMode('creator')} aria-pressed={mode === 'creator'}>
+            <button className={`mode-tab ${mode === 'creator' ? 'active' : ''}`} onClick={() => handleModeChange('creator')} aria-pressed={mode === 'creator'}>
               👤 博主笔记
             </button>
             <button
               className={`mode-tab experimental ${mode === 'search' ? 'active' : ''}`}
-              onClick={() => setMode('search')}
+              onClick={() => handleModeChange('search')}
               title="实验性功能：小红书原生搜索体验更佳，此处仅适合批量存档场景"
               aria-pressed={mode === 'search'}
             >
@@ -953,14 +1185,15 @@ function App() {
                 </div>
                 <div className="progress-body">
                   <div className="progress-stats">
-                    <span className="progress-count">已找到 <strong>{progress.count}</strong> / 目标 <strong>{targetCount}</strong> 条</span>
+                    <span className="progress-count">已发现索引：<strong>{progress.discoveredCount}</strong> 条</span>
+                    <span className="progress-count">已解析详情：<strong>{progress.parsedCount}</strong> / 目标 <strong>{targetCount}</strong> 条</span>
                     <span className="progress-elapsed">⏱ {Math.round(progress.elapsedMs / 1000)}s</span>
                     <span className={`progress-status ${progress.status}`}>
                       {progress.status === 'running' ? '🟢 爬取中' : progress.status === 'idle' ? '⚪ 空闲' : progress.status}
                     </span>
                   </div>
                   {/* 冷启动提示：count=0 时说明正在等 detail 反爬 */}
-                  {progress.count === 0 && progress.status === 'running' && (
+                  {progress.parsedCount === 0 && progress.status === 'running' && (
                     <div className="progress-hint">
                       ⏳ 正在建立连接并获取索引页，小红书 detail 反爬延迟通常 30–120s才会出现首条数据，请稍候…
                     </div>
@@ -968,7 +1201,7 @@ function App() {
                   <div className="progress-bar">
                     <div
                       className="progress-bar-fill"
-                      style={{ width: `${Math.min(100, (progress.count / Math.max(1, targetCount)) * 100)}%` }}
+                      style={{ width: `${Math.min(100, (progress.parsedCount / Math.max(1, targetCount)) * 100)}%` }}
                     />
                   </div>
                   <button className="finish-early-btn" onClick={handleFinishEarly}>
@@ -989,7 +1222,7 @@ function App() {
               </div>
               {currentError.showLoginAction ? (
                 <button className="error-login-btn" onClick={() => setShowLoginModal(true)}>
-                  打开增强模式
+                  启用增强模式
                 </button>
               ) : null}
             </div>
@@ -1075,13 +1308,13 @@ function App() {
                   </a>
                 )}
                 {noteInfo.type === 'video' && noteInfo.video ? (
-                  <button className="primary-action-btn" onClick={() => handleDownload(noteInfo.video!.url, `video_${noteInfo.noteId}.mp4`, noteInfo.video!.backupUrls || [])}>
+                  <button className="primary-action-btn" onClick={() => handleDownloadNoteMedia(noteInfo)} disabled={noteDownloading}>
                     下载视频
                   </button>
                 ) : noteInfo.images.length > 0 ? (
                   <button
                     className="primary-action-btn"
-                    onClick={() => handleDownloadNoteImages(noteInfo)}
+                    onClick={() => handleDownloadNoteMedia(noteInfo)}
                     disabled={noteDownloading}
                   >
                     {noteDownloading
@@ -1105,7 +1338,7 @@ function App() {
                         className="watermark-login-btn"
                         onClick={() => setShowLoginModal(true)}
                       >
-                        重新登录
+                        启用增强模式
                       </button>
                       后重试
                     </div>
@@ -1174,9 +1407,29 @@ function App() {
                 )}
               </div>
               <button className="download-all-btn" onClick={handleBatchDownload} disabled={selectedNotes.size === 0 || batchDownloading}>
-                {batchDownloading ? '打包中...' : `📦 打包下载 (${selectedNotes.size})`}
+                {batchDownloading
+                  ? batchProgress?.status === 'enriching'
+                    ? `补全中 ${batchProgress.enrichedNotes}/${batchProgress.totalNotes}`
+                    : batchProgress?.status === 'downloading'
+                      ? `打包中 ${batchProgress.zippedFiles}/${Math.max(1, batchProgress.totalFiles)}`
+                      : '准备下载...'
+                  : `📦 打包下载 (${selectedNotes.size})`}
               </button>
             </div>
+
+            {batchProgress && (
+              <div className={`batch-progress-card ${batchProgress.status}`} role="status" aria-live="polite">
+                <div className="batch-progress-header">
+                  <strong>{batchProgress.message}</strong>
+                  <span>{batchProgress.status === 'completed' ? '已完成' : batchProgress.status === 'failed' ? '失败' : '处理中'}</span>
+                </div>
+                <div className="batch-progress-stats">
+                  <span>补全：{batchProgress.enrichedNotes} / {batchProgress.totalNotes}</span>
+                  <span>加入 ZIP：{batchProgress.zippedFiles} / {batchProgress.totalFiles || '-'}</span>
+                  <span>已下载：{formatBytes(batchProgress.downloadedBytes)}</span>
+                </div>
+              </div>
+            )}
 
             {/* 表格布局 */}
             <div className="note-table">
@@ -1189,8 +1442,14 @@ function App() {
                 <div className="col-stats">数据</div>
                 <div className="col-actions">操作</div>
               </div>
-              {paginatedNotes.map((note, idx) => (
-                <div key={note.noteId || idx} className={`note-table-row ${selectedNotes.has(note.noteId) ? 'selected' : ''}`}>
+              {paginatedNotes.map((note, idx) => {
+                const noteKey = getNoteKey(note) || String(idx);
+                const previewIndex = Math.min(previewIndexes[noteKey] || 0, Math.max(0, note.images.length - 1));
+                const previewImage = note.images[previewIndex] || note.images[0] || '';
+                const previewLivePhoto = note.livePhotos?.find(item => item.index === previewIndex);
+                const isEnriching = enrichingNoteIds.has(noteKey);
+                return (
+                <div key={noteKey} className={`note-table-row ${selectedNotes.has(note.noteId) ? 'selected' : ''}`}>
                   <div className="col-checkbox">
                     <input
                       type="checkbox"
@@ -1219,15 +1478,47 @@ function App() {
                         playsInline
                         poster={getProxyUrl(note.images[0], 'image')}
                       />
-                    ) : note.images[0] ? (
-                      <img
-                        src={getProxyUrl(note.images[0], 'image')}
-                        alt="预览"
-                        className="table-image-preview"
-                        loading="lazy"
-                        decoding="async"
-                        onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/60x80?text=加载失败'; }}
-                      />
+                    ) : previewImage ? (
+                      <div className="table-preview-carousel">
+                        <button
+                          className="preview-image-button"
+                          type="button"
+                          onClick={() => handleOpenNoteDetail(note)}
+                          aria-label="查看笔记详情"
+                        >
+                          {previewLivePhoto && <span className="preview-live-badge">实况</span>}
+                          {isEnriching && <span className="preview-enriching-badge">补全中</span>}
+                          <img
+                            src={getProxyUrl(previewImage, 'image')}
+                            alt={`预览 ${previewIndex + 1}`}
+                            className="table-image-preview"
+                            loading="lazy"
+                            decoding="async"
+                            onError={(e) => { (e.target as HTMLImageElement).src = 'https://via.placeholder.com/60x80?text=加载失败'; }}
+                          />
+                        </button>
+                        {note.images.length > 1 && (
+                          <div className="preview-carousel-controls" aria-label="图片切换">
+                            <button
+                              className="preview-nav-btn"
+                              type="button"
+                              onClick={() => handlePreviewStep(note, -1)}
+                              aria-label="上一张图片"
+                            >
+                              ‹
+                            </button>
+                            <span className="preview-counter">{previewIndex + 1}/{note.images.length}</span>
+                            <button
+                              className="preview-nav-btn"
+                              type="button"
+                              onClick={() => handlePreviewStep(note, 1)}
+                              aria-label="下一张图片"
+                            >
+                              ›
+                            </button>
+                          </div>
+                        )}
+                      </div>
                     ) : (
                       <div className="no-preview">无预览</div>
                     )}
@@ -1268,7 +1559,7 @@ function App() {
                           className="action-btn creator-btn"
                           onClick={() => {
                             setUrl(note.creatorUrl!);
-                            setMode('creator');
+                            handleModeChange('creator');
                           }}
                           title="查看博主"
                           aria-label="查看博主"
@@ -1279,7 +1570,7 @@ function App() {
                       {note.type === 'video' && note.video ? (
                         <button
                           className="action-btn download-btn-table"
-                          onClick={() => handleDownload(note.video!.url, `video_${note.noteId}.mp4`, note.video!.backupUrls || [])}
+                          onClick={() => handleDownloadNoteMedia(note)}
                           title="下载视频"
                           aria-label="下载视频"
                         >
@@ -1288,7 +1579,7 @@ function App() {
                       ) : (
                         <button
                           className="action-btn download-btn-table"
-                          onClick={() => handleDownloadNoteImages(note)}
+                          onClick={() => handleDownloadNoteMedia(note)}
                           title={(note.livePhotos?.length || 0) > 0 ? '打包下载实况组件' : '下载图片'}
                           aria-label={(note.livePhotos?.length || 0) > 0 ? '打包下载实况组件' : '下载图片'}
                         >
@@ -1298,7 +1589,8 @@ function App() {
                     </div>
                   </div>
                 </div>
-              ))}
+                );
+              })}
             </div>
 
             {/* 分页 */}
@@ -1369,6 +1661,11 @@ function App() {
       </footer>
     </div>
   );
+}
+
+function App() {
+  const apiBase = import.meta.env.VITE_API_URL ?? '';
+  return <PublicApp apiBase={apiBase} />;
 }
 
 export default App;

@@ -127,7 +127,7 @@ Enable the mirror-related values:
 
 ```env
 NODE_IMAGE=public.ecr.aws/docker/library/node:20-slim
-PYTHON_IMAGE=python:3.11-slim
+PYTHON_IMAGE=python:3.11-slim-bookworm
 USE_ALIYUN_APT_MIRROR=true
 NPM_REGISTRY=https://registry.npmmirror.com
 PIP_INDEX_URL=https://pypi.tuna.tsinghua.edu.cn/simple

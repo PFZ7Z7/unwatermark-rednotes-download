@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile:1.6
 
-ARG PYTHON_IMAGE=python:3.11-slim
+ARG PYTHON_IMAGE=python:3.11-slim-bookworm
 FROM ${PYTHON_IMAGE} AS driver
 
 WORKDIR /app
@@ -40,7 +40,7 @@ COPY docker/driver/xhs_cookie_validate.py api/xhs_cookie_validate.py
 
 RUN python -m pip install --upgrade pip \
     && python -m pip config set global.index-url "${PIP_INDEX_URL}" \
-    && python -m pip install .
+    && python -m pip install -r requirements.txt
 
 RUN if [ "${USE_ALIYUN_APT_MIRROR}" = "true" ]; then \
         sed -i \

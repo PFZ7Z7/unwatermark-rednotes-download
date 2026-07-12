@@ -32,7 +32,11 @@ RUN if [ "${USE_ALIYUN_APT_MIRROR}" = "true" ]; then \
 RUN git init MediaCrawler \
     && cd MediaCrawler \
     && git remote add origin "${MEDIACRAWLER_REPO}" \
-    && git fetch --depth 1 origin "${MEDIACRAWLER_REF}" \
+    && for attempt in 1 2 3 4 5; do \
+         git -c http.version=HTTP/1.1 fetch --depth 1 origin "${MEDIACRAWLER_REF}" && break; \
+         if [ "${attempt}" = "5" ]; then exit 1; fi; \
+         sleep $((attempt * 3)); \
+       done \
     && git checkout --detach FETCH_HEAD
 
 WORKDIR /app/MediaCrawler

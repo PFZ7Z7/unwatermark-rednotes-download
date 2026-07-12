@@ -53,7 +53,9 @@ describe('admin cookie store', () => {
     assert.equal(parsed.cookie, 'a=1; web_session=session-value; webId=abc');
     assert.equal(parsed.validationMode, 'selfinfo-v2');
     assert.equal(parsed.account.nickname, 'tester');
-    assert.equal(fs.statSync(process.env.XHS_COOKIE_STORE_PATH!).mode & 0o777, 0o600);
+    if (process.platform !== 'win32') {
+      assert.equal(fs.statSync(process.env.XHS_COOKIE_STORE_PATH!).mode & 0o777, 0o600);
+    }
   });
 
   test('reads the stored cookie for internal service use', () => {

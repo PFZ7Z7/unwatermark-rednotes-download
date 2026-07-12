@@ -4,6 +4,7 @@ import dotenv from 'dotenv';
 import archiver from 'archiver';
 import path from 'path';
 import fs from 'fs';
+import crypto from 'crypto';
 import { XiaohongshuService, LoginRequiredError, type NoteInfo } from './services/xiaohongshu';
 import { createDownloadJobStore } from './services/downloadJobStore';
 import {
@@ -20,6 +21,8 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 3001;
 const MEDIACRAWLER_API = process.env.MEDIACRAWLER_API || 'http://localhost:8080';
+const APP_API_TOKEN = process.env.APP_API_TOKEN || '';
+const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || '').replace(/\/+$/, '');
 
 const ENHANCED_MODE_READY_MESSAGE = '增强模式已可用';
 const ENHANCED_MODE_MAINTENANCE_MESSAGE = '增强模式维护中，普通链接下载不受影响';
@@ -66,6 +69,20 @@ type DownloadItem = {
   fallbackUrls?: string[];
 };
 
+type AppMediaKind = 'image' | 'video' | 'live_photo_image' | 'live_photo_video';
+
+type AppMediaResource = {
+  order: number;
+  index: number;
+  kind: AppMediaKind;
+  url: string;
+  sourceUrl: string;
+  proxyUrl?: string;
+  fallbackUrls?: string[];
+  fallbackSourceUrls?: string[];
+  duration?: number;
+};
+
 const DOWNLOAD_JOB_ID_PATTERN = /^[a-f0-9]{24}$/i;
 const downloadJobs = createDownloadJobStore<NoteInfo, DownloadItem>({
   ttlMs: DOWNLOAD_JOB_TTL_MS,
@@ -82,6 +99,99 @@ function isAllowedProxyUrl(rawUrl: string): boolean {
   } catch {
     return false;
   }
+}
+
+function normalizeHttpUrl(rawUrl: unknown): string | null {
+  if (typeof rawUrl !== 'string') return null;
+  const trimmed = rawUrl.trim();
+  if (!trimmed) return null;
+  try {
+    const url = new URL(trimmed);
+    if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+    if (url.username || url.password) return null;
+    return trimmed;
+  } catch {
+    return null;
+  }
+}
+
+function timingSafeEqualString(a: string, b: string): boolean {
+  const left = Buffer.from(a);
+  const right = Buffer.from(b);
+  return left.length === right.length && crypto.timingSafeEqual(left, right);
+}
+
+function requireAppApiToken(req: Request, res: Response): boolean {
+  if (!APP_API_TOKEN) {
+    res.status(503).json({ success: false, message: 'App API token is not configured' });
+    return false;
+  }
+
+  const auth = req.get('authorization') || '';
+  const match = auth.match(/^Bearer\s+(.+)$/i);
+  const token = match?.[1]?.trim() || '';
+  if (!token || !timingSafeEqualString(token, APP_API_TOKEN)) {
+    res.status(401).json({ success: false, message: 'App API token is missing or invalid' });
+    return false;
+  }
+
+  return true;
+}
+
+function getRequestBaseUrl(req: Request): string {
+  if (PUBLIC_BASE_URL) return PUBLIC_BASE_URL;
+  const forwardedProto = getSingleParam(req.headers['x-forwarded-proto']).split(',')[0]?.trim();
+  const forwardedHost = getSingleParam(req.headers['x-forwarded-host']).split(',')[0]?.trim();
+  const proto = forwardedProto || req.protocol || 'http';
+  const host = forwardedHost || req.get('host') || '';
+  return host ? `${proto}://${host}` : '';
+}
+
+function buildAppMediaUrl(req: Request, mediaType: 'image' | 'video', sourceUrl: string, useProxy: boolean): {
+  url: string;
+  proxyUrl?: string;
+} {
+  if (!useProxy || !isAllowedProxyUrl(sourceUrl)) {
+    return { url: sourceUrl };
+  }
+
+  const baseUrl = getRequestBaseUrl(req);
+  const proxyPath = `/api/proxy/${mediaType}?url=${encodeURIComponent(sourceUrl)}`;
+  const proxyUrl = baseUrl ? `${baseUrl}${proxyPath}` : proxyPath;
+  return { url: proxyUrl, proxyUrl };
+}
+
+function createAppMediaResource(
+  req: Request,
+  input: {
+    order: number;
+    index: number;
+    kind: AppMediaKind;
+    mediaType: 'image' | 'video';
+    sourceUrl: string;
+    useProxy: boolean;
+    fallbackSourceUrls?: string[];
+    duration?: number;
+  }
+): AppMediaResource {
+  const primary = buildAppMediaUrl(req, input.mediaType, input.sourceUrl, input.useProxy);
+  const fallbackSourceUrls = (input.fallbackSourceUrls || [])
+    .map(normalizeHttpUrl)
+    .filter((url): url is string => Boolean(url));
+  const fallbackUrls = fallbackSourceUrls
+    .map((url) => buildAppMediaUrl(req, input.mediaType, url, input.useProxy).url);
+
+  return {
+    order: input.order,
+    index: input.index,
+    kind: input.kind,
+    url: primary.url,
+    sourceUrl: input.sourceUrl,
+    proxyUrl: primary.proxyUrl,
+    fallbackUrls: fallbackUrls.length > 0 ? fallbackUrls : undefined,
+    fallbackSourceUrls: fallbackSourceUrls.length > 0 ? fallbackSourceUrls : undefined,
+    duration: input.duration,
+  };
 }
 
 // 日志脱敏：去掉 URL 里的 xsec_token，避免临时凭证落到日志文件
@@ -196,6 +306,136 @@ function collectDownloadItems(notes: NoteInfo[]): DownloadItem[] {
     }
   }
   return downloadItems;
+}
+
+function buildAppNoteResources(req: Request, note: NoteInfo, useProxy: boolean) {
+  const images: AppMediaResource[] = [];
+  const videos: AppMediaResource[] = [];
+  const assets: AppMediaResource[] = [];
+  let assetOrder = 0;
+
+  const addImage = (sourceUrl: string, index: number, kind: AppMediaKind) => {
+    const item = createAppMediaResource(req, {
+      order: assetOrder++,
+      index,
+      kind,
+      mediaType: 'image',
+      sourceUrl,
+      useProxy,
+    });
+    images.push(item);
+    assets.push(item);
+  };
+
+  const addVideo = (
+    sourceUrl: string,
+    index: number,
+    kind: AppMediaKind,
+    fallbackSourceUrls?: string[],
+    duration?: number
+  ) => {
+    const item = createAppMediaResource(req, {
+      order: assetOrder++,
+      index,
+      kind,
+      mediaType: 'video',
+      sourceUrl,
+      useProxy,
+      fallbackSourceUrls,
+      duration,
+    });
+    videos.push(item);
+    assets.push(item);
+  };
+
+  if (note.type === 'video') {
+    const videoUrl = normalizeHttpUrl(note.video?.url);
+    if (videoUrl) {
+      addVideo(videoUrl, 0, 'video', note.video?.backupUrls, note.video?.duration);
+    }
+  }
+
+  const livePhotosByIndex = new Map<number, NonNullable<NoteInfo['livePhotos']>[number]>();
+  for (const [liveIdx, livePhoto] of (note.livePhotos || []).entries()) {
+    const index = Number.isInteger(livePhoto?.index) ? Number(livePhoto.index) : liveIdx;
+    livePhotosByIndex.set(index, livePhoto);
+  }
+
+  for (const [imageIdx, rawImageUrl] of (note.images || []).entries()) {
+    const livePhoto = livePhotosByIndex.get(imageIdx);
+    const imageUrl = normalizeHttpUrl(livePhoto?.imageUrl) || normalizeHttpUrl(rawImageUrl);
+    if (imageUrl) {
+      addImage(imageUrl, images.length, livePhoto ? 'live_photo_image' : 'image');
+    }
+
+    const liveVideoUrl = normalizeHttpUrl(livePhoto?.videoUrl);
+    if (liveVideoUrl) {
+      addVideo(
+        liveVideoUrl,
+        videos.length,
+        'live_photo_video',
+        livePhoto?.videoUrls?.filter((url) => url !== livePhoto.videoUrl),
+        livePhoto?.duration
+      );
+    }
+  }
+
+  for (const [liveIdx, livePhoto] of (note.livePhotos || []).entries()) {
+    const resolvedIndex = Number.isInteger(livePhoto?.index) ? Number(livePhoto.index) : liveIdx;
+    if (resolvedIndex >= 0 && resolvedIndex < (note.images || []).length) continue;
+
+    const imageUrl = normalizeHttpUrl(livePhoto?.imageUrl);
+    if (imageUrl) {
+      addImage(imageUrl, images.length, 'live_photo_image');
+    }
+
+    const liveVideoUrl = normalizeHttpUrl(livePhoto?.videoUrl);
+    if (liveVideoUrl) {
+      addVideo(
+        liveVideoUrl,
+        videos.length,
+        'live_photo_video',
+        livePhoto?.videoUrls?.filter((url) => url !== livePhoto.videoUrl),
+        livePhoto?.duration
+      );
+    }
+  }
+
+  const title = note.title || '';
+  const description = note.desc || '';
+
+  return {
+    noteId: note.noteId,
+    type: note.type,
+    noteUrl: note.noteUrl,
+    creatorUrl: note.creatorUrl,
+    title,
+    description,
+    text: {
+      title,
+      description,
+      plain: [title, description].filter(Boolean).join('\n\n'),
+    },
+    author: note.author,
+    stats: {
+      likes: note.likes,
+      collects: note.collects,
+      comments: note.comments,
+      shares: note.shares,
+    },
+    publishTime: note.publishTime,
+    ipLocation: note.ipLocation,
+    tags: note.tags || [],
+    parseMode: note.parseMode,
+    hasWatermark: note.hasWatermark,
+    links: {
+      proxy: useProxy,
+      baseUrl: getRequestBaseUrl(req) || undefined,
+    },
+    images,
+    videos,
+    assets,
+  };
 }
 
 function buildDownloadJobPayload(jobId: string) {
@@ -400,6 +640,29 @@ let currentTaskId = 0;
 
 app.get('/api/health', (req: Request, res: Response) => {
   res.json({ status: 'ok', message: '小红书下载服务运行中' });
+});
+
+app.post('/api/app/note-resources', async (req: Request, res: Response) => {
+  if (!requireAppApiToken(req, res)) return;
+
+  try {
+    const { url, proxy = true } = req.body || {};
+    if (!url || typeof url !== 'string') {
+      return res.status(400).json({ success: false, message: '请提供小红书链接' });
+    }
+
+    console.log(`[App API] 解析笔记资源: ${redactUrl(url)}`);
+    const noteDetail = await xhsService.getNoteDetail(url);
+    const data = buildAppNoteResources(req, noteDetail, proxy !== false);
+
+    res.json({
+      success: true,
+      data,
+    });
+  } catch (error: any) {
+    console.error('[App API] 解析资源错误:', error.message);
+    sendError(res, error);
+  }
 });
 
 // 检查登录状态

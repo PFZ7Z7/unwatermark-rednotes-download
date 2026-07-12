@@ -27,6 +27,8 @@ services:
       # CORS：同源访问用不到；如需跨域前端，用逗号分隔
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3001,http://127.0.0.1:3001}
       # 其他可选调参（见 backend/.env.example）
+      APP_API_TOKEN: ${APP_API_TOKEN:-}
+      PUBLIC_BASE_URL: ${PUBLIC_BASE_URL:-}
       MEDIACRAWLER_CONCURRENCY: ${MEDIACRAWLER_CONCURRENCY:-1}
       RESULT_CACHE_TTL_MS: ${RESULT_CACHE_TTL_MS:-300000}
       RUNTIME_DATA_RETENTION_DAYS: ${RUNTIME_DATA_RETENTION_DAYS:-3}

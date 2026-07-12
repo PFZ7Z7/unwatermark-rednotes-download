@@ -66,6 +66,8 @@ services:
         MEDIACRAWLER_REF: ${MEDIACRAWLER_REF:-165776886faf56d44651d4dbd290b015582a97f2}
     image: xhs-driver:latest
     container_name: xhs-driver
+    # Run Docker's tiny init as PID 1 so orphaned browser subprocesses are reaped.
+    init: true
     restart: unless-stopped
     volumes:
       - xhs_driver_browser_data:/app/MediaCrawler/browser_data

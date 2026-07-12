@@ -89,7 +89,97 @@ new = '''safe_cmd = [
             entry = self._create_log_entry(f"Starting crawler: {' '.join(safe_cmd)}", "info")'''
 if old in manager_text:
     manager_text = manager_text.replace(old, new)
+manager_text = manager_text.replace(
+    '''                # If still not exited, force kill
+                if self.process.poll() is None:
+                    entry = self._create_log_entry("Process not responding, sending SIGKILL...", "warning")
+                    await self._push_log(entry)
+                    self.process.kill()
+
+                entry = self._create_log_entry("Crawler process terminated", "info")''',
+    '''                # If still not exited, force kill
+                if self.process.poll() is None:
+                    entry = self._create_log_entry("Process not responding, sending SIGKILL...", "warning")
+                    await self._push_log(entry)
+                    self.process.kill()
+
+                # Reap the child process so it cannot remain as a zombie.
+                if self.process:
+                    loop = asyncio.get_event_loop()
+                    await loop.run_in_executor(None, self.process.wait)
+
+                entry = self._create_log_entry("Crawler process terminated", "info")''',
+)
+manager_text = manager_text.replace(
+    '''            # Process ended
+            if self.status == "running":
+                exit_code = self.process.returncode if self.process else -1
+                if exit_code == 0:''',
+    '''            # Process ended. wait() reaps the child process after stdout is drained.
+            exit_code = -1
+            if self.process:
+                exit_code = await loop.run_in_executor(None, self.process.wait)
+            if self.status == "running":
+                if exit_code == 0:''',
+)
 manager.write_text(manager_text, encoding="utf-8")
+
+browser_launcher = Path("tools/browser_launcher.py")
+browser_launcher_text = browser_launcher.read_text(encoding="utf-8")
+old = '''        if process.poll() is not None:
+            utils.logger.info("[BrowserLauncher] Browser process already exited, no cleanup needed")
+            self.browser_process = None
+            return'''
+new = '''        if process.poll() is not None:
+            utils.logger.info("[BrowserLauncher] Browser process already exited, reaping it")
+            try:
+                process.wait(timeout=0)
+            except Exception:
+                pass
+            self.browser_process = None
+            return'''
+if old in browser_launcher_text:
+    browser_launcher_text = browser_launcher_text.replace(old, new)
+browser_launcher.write_text(browser_launcher_text, encoding="utf-8")
+
+xhs_core = Path("media_platform/xhs/core.py")
+xhs_core_text = xhs_core.read_text(encoding="utf-8")
+xhs_core_text = xhs_core_text.replace(
+    "BrowserContext,\n    BrowserType,",
+    "Browser,\n    BrowserContext,\n    BrowserType,",
+)
+xhs_core_text = xhs_core_text.replace(
+    "    browser_context: BrowserContext\n    cdp_manager: Optional[CDPBrowserManager]",
+    "    browser: Optional[Browser]\n    browser_context: BrowserContext\n    cdp_manager: Optional[CDPBrowserManager]",
+)
+xhs_core_text = xhs_core_text.replace(
+    "        self.cdp_manager = None\n        self.ip_proxy_pool = None",
+    "        self.browser = None\n        self.cdp_manager = None\n        self.ip_proxy_pool = None",
+)
+xhs_core_text = xhs_core_text.replace(
+    "            browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore\n"
+    "            browser_context = await browser.new_context(viewport={\"width\": 1920, \"height\": 1080}, user_agent=user_agent)\n"
+    "            return browser_context",
+    "            self.browser = await chromium.launch(headless=headless, proxy=playwright_proxy)  # type: ignore\n"
+    "            browser_context = await self.browser.new_context(viewport={\"width\": 1920, \"height\": 1080}, user_agent=user_agent)\n"
+    "            return browser_context",
+)
+xhs_core_text = xhs_core_text.replace(
+    "        else:\n"
+    "            await self.browser_context.close()\n"
+    "        utils.logger.info(\"[XiaoHongShuCrawler.close] Browser context closed ...\")",
+    "        else:\n"
+    "            await self.browser_context.close()\n"
+    "            if self.browser:\n"
+    "                try:\n"
+    "                    await self.browser.close()\n"
+    "                except Exception as browser_error:\n"
+    "                    utils.logger.warning(f\"[XiaoHongShuCrawler.close] Browser close failed: {browser_error}\")\n"
+    "                finally:\n"
+    "                    self.browser = None\n"
+    "        utils.logger.info(\"[XiaoHongShuCrawler.close] Browser context closed ...\")",
+)
+xhs_core.write_text(xhs_core_text, encoding="utf-8")
 
 main_text = main.read_text(encoding="utf-8")
 main_text = main_text.replace(
